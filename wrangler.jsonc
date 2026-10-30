@@ -1,0 +1,10 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "prefor-pon",
+  "compatibility_date": "2026-10-01",
+  // Static-assets Worker: the whole sim runs client-side on the GPU.
+  "assets": {
+    "directory": "./public",
+    "not_found_handling": "single-page-application"
+  }
+}

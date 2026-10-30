@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Prefor.Pon</title>
+<meta name="description" content="GPU particle field — millions of particles, one compute pass.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@1,9..144,500&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<canvas id="gl" tabindex="0" aria-label="Particle field"></canvas>
+
+<header class="mark">
+  <h1>Prefor<span>.</span>Pon</h1>
+</header>
+
+<aside class="readout" aria-live="off">
+  <dl>
+    <div><dt>n</dt><dd id="n">—</dd></div>
+    <div><dt>fps</dt><dd id="fps">—</dd></div>
+    <div><dt>ms</dt><dd id="ms">—</dd></div>
+  </dl>
+</aside>
+
+<nav class="tools" aria-label="Controls">
+  <button id="less" aria-label="Fewer particles" title="Fewer  [−]">
+    <svg viewBox="0 0 24 24"><path d="M5 12h14"/></svg>
+  </button>
+  <button id="more" aria-label="More particles" title="More  [+]">
+    <svg viewBox="0 0 24 24"><path d="M5 12h14M12 5v14"/></svg>
+  </button>
+  <button id="flip" aria-label="Attract or repel" aria-pressed="false" title="Attract / repel  [space]">
+    <svg viewBox="0 0 24 24" class="in"><circle cx="12" cy="12" r="2.2"/><path d="M12 3v4M12 17v4M3 12h4M17 12h4M9.5 9.5 7 7M14.5 9.5 17 7M9.5 14.5 7 17M14.5 14.5 17 17"/></svg>
+  </button>
+  <button id="reset" aria-label="Reset" title="Reset  [R]">
+    <svg viewBox="0 0 24 24"><path d="M4 12a8 8 0 1 0 2.4-5.7"/><path d="M4 4v5h5"/></svg>
+  </button>
+  <button id="learn" aria-label="Replay tutorial" title="Tutorial">
+    <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="M10 9.2a2.2 2.2 0 1 1 3 2.1c-.7.3-1 .8-1 1.5v.5M12 16.6v.2"/></svg>
+  </button>
+</nav>
+
+<div id="tut" class="tut" hidden>
+  <svg class="ghost" viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true">
+    <path id="trail" d="M20 70 C 35 30, 65 30, 80 60" />
+  </svg>
+  <div class="finger" aria-hidden="true"></div>
+  <p class="word" id="word"></p>
+  <button class="skip" id="skip" aria-label="Skip tutorial">
+    <svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></svg>
+  </button>
+</div>
+
+<div id="nogpu" class="nogpu" hidden>
+  <p>WebGPU <span>×</span></p>
+</div>
+
+<script type="module" src="main.js"></script>
+</body>
+</html>
