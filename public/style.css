@@ -1,6 +1,6 @@
 /* Palette: "darkroom" — warm ink, bone, one sodium-lamp accent. The field is the interface. */
 :root {
-  --ink: #12100d;
+  --ink: #040405;
   --bone: #e9e2d2;
   --dim: #6f685d;
   --sodium: #ff6a1a;
@@ -37,7 +37,7 @@ canvas {
 .n {
   position: fixed;
   left: var(--pad);
-  bottom: var(--bottom);
+  top: max(16px, env(safe-area-inset-top));
   margin: 0;
   font-size: 11px;
   letter-spacing: 0.04em;
@@ -98,6 +98,7 @@ canvas {
   cursor: pointer;
 }
 #rate:focus-visible { outline: none; }
+#myr { font-size: 11px; min-width: 9ch; font-variant-numeric: tabular-nums; }
 #rate::-webkit-slider-runnable-track { height: 1px; background: currentColor; }
 #rate::-moz-range-track { height: 1px; background: currentColor; }
 #rate::-webkit-slider-thumb {

@@ -1,5 +1,5 @@
-// Prefor.Pon — GPU galaxy simulation: particle-mesh self-gravity, millions of stars.
-// Particles never leave the GPU: compute shader integrates, render pass reads the same buffers.
+// Prefor.Pon — GPU galaxy simulation: particle-mesh self-gravity, dark halos, gas and star formation.
+// Particles never leave the GPU: compute shaders integrate, render passes read the same buffers.
 
 const coarse = matchMedia("(pointer: coarse)").matches;
 const CAP = coarse ? 1 << 19 : 1 << 21; // buffer capacity; active count adapts below it
@@ -10,9 +10,18 @@ const MAX_SUBSTEPS = 2; // more substeps on a slow frame only makes the next fra
 const WG = 256;
 const SHOCKS = 4;
 const GALAXIES = 3;
-const TRAIL = 0.7; // fraction of last frame kept
 const GRID = coarse ? 40 : 56; // gravity grid rows; columns follow the aspect ratio
-const G = 0.22;
+const G = 0.5;
+// ?n=262144 pins the particle count (for benchmarking and comparing looks); otherwise it adapts.
+const FIXED_N = Math.max(0, Math.min(1 << 22, parseInt(new URLSearchParams(location.search).get("n"), 10) || 0));
+
+// Particle kinds. Each is picked by hash, so any prefix [0, count) is a fair sample.
+//   0 old star · 1 young star · 2 gas · 3 dark matter
+const KIND_SHARE = [0.4, 0.06, 0.24, 0.3];
+const DM_WEIGHT = 8; // one dark-matter particle outweighs eight baryonic ones: ~3.4x more dark than visible mass
+const MEAN_W = 0.7 + 0.3 * DM_WEIGHT;
+const LIFE = 0.45; // young-star phase in sim seconds (~70 Myr)
+const MYR_PER_SEC = 150; // 1 sim unit of length = 25 kpc, 1 unit of velocity ~ 165 km/s
 
 const U_WGSL = /* wgsl */ `
 struct U {
@@ -20,9 +29,13 @@ struct U {
   seed: u32, gx: u32, gy: u32, ngal: u32,
   well: vec4f,                     // xy pos, z = G*M of the black hole under the finger
   shocks: array<vec4f, ${SHOCKS}>, // xy origin, z age, w strength
-  gal: array<vec4f, ${GALAXIES * 2}>, // per galaxy: (cx, cy, vx, vy), (scale, cumulative share, spin, mass)
+  gal: array<vec4f, ${GALAXIES * 2}>, // per galaxy: (cx, cy, vx, vy), (disc scale, cumulative share, spin, mass)
   grav: vec4f,                     // G, softening^2, cell w, cell h
 };
+const KIND_SHARE = vec4f(${KIND_SHARE.join(", ")});
+const DM_WEIGHT = ${DM_WEIGHT}u;
+const MEAN_W = ${MEAN_W.toFixed(4)};
+const LIFE = ${LIFE};
 `;
 
 const SIM_WGSL = U_WGSL + /* wgsl */ `
@@ -31,6 +44,8 @@ const SIM_WGSL = U_WGSL + /* wgsl */ `
 @group(0) @binding(2) var<storage, read_write> vel: array<vec2f>;
 @group(0) @binding(3) var<storage, read_write> mass: array<atomic<u32>>;
 @group(0) @binding(4) var<storage, read_write> field: array<vec2f>;
+@group(0) @binding(5) var<storage, read_write> attr: array<vec2f>; // kind, birth time
+@group(0) @binding(6) var<storage, read_write> gas: array<atomic<u32>>;
 
 fn pcg(v: u32) -> u32 {
   let s = v * 747796405u + 2891336453u;
@@ -42,8 +57,15 @@ fn rnd(h: ptr<function, u32>) -> f32 {
   return (f32(*h >> 8u) + 0.5) * (1.0 / 16777216.0);
 }
 
-// Spiral discs on circular orbits. The galaxy is picked by hash, not by index,
-// so any prefix [0, count) is a fair sample and the adaptive count never skews the mass.
+fn kindOf(x: f32) -> u32 {
+  var c = KIND_SHARE.x;
+  if (x < c) { return 0u; }
+  c += KIND_SHARE.y; if (x < c) { return 1u; }
+  c += KIND_SHARE.z; if (x < c) { return 2u; }
+  return 3u;
+}
+
+// Exponential disc of stars and gas inside a Hernquist dark halo, on near-circular orbits.
 @compute @workgroup_size(${WG})
 fn seed(@builtin(global_invocation_id) id: vec3u) {
   let i = id.x;
@@ -55,20 +77,47 @@ fn seed(@builtin(global_invocation_id) id: vec3u) {
   let g0 = u.gal[k * 2u];
   let g1 = u.gal[k * 2u + 1u];
   let rd = g1.x;
+  let ha = rd * 6.0; // halo scale: diffuse enough that the disc's own gravity can grow spiral arms
+  let mb = g1.w * 0.7 / MEAN_W;
+  let mh = g1.w - mb;
+  var kind = kindOf(rnd(&h));
+
   let a = rnd(&h) * 6.2831853;
   var r: f32;
-  if (rnd(&h) < 0.18) {
-    r = rd * 0.35 * sqrt(-2.0 * log(rnd(&h))); // bulge
+  var disp = 0.05; // velocity dispersion as a fraction of circular speed: gas and young stars are cold
+  if (kind == 3u) {
+    let s = sqrt(rnd(&h) * 0.4); // Hernquist, truncated at 40% of its mass (~1.7 scale radii)
+    r = ha * s / (1.0 - s);
+  } else if (kind == 0u && rnd(&h) < 0.35) {
+    r = rd * 0.3 * sqrt(-2.0 * log(rnd(&h))); // bulge: old and hot
+    disp = 0.6;
   } else {
-    r = min(-rd * log(rnd(&h) * rnd(&h)), rd * 5.0); // exponential disc
+    r = -rd * log(rnd(&h) * rnd(&h));
+    if (r > rd * 6.0) { r = rd * 6.0 * rnd(&h); } // re-draw the far tail instead of piling it on a ring
+    if (kind == 0u) { disp = 0.12; }
   }
-  let d = vec2f(cos(a), sin(a));
+  // Seed a two-armed logarithmic spiral (pitch ~15°) in the disc: real discs carry density waves,
+  // and a smooth start would take far longer than the encounter to grow its own.
+  var th = a;
+  if (kind != 3u && disp < 0.5) {
+    let amp = select(select(0.9, 0.7, kind == 1u), 0.3, kind == 0u);
+    let phase = log(max(r, 1e-3) / rd) / 0.27;
+    th = a - 0.5 * amp * sin(2.0 * (a - phase));
+  }
+  let d = vec2f(cos(th), sin(th));
   let x = r / rd;
-  let enclosed = g1.w * (1.0 - (1.0 + x) * exp(-x));
+  let enclosed = mb * (1.0 - (1.0 + x) * exp(-x)) + mh * min(1.0, 2.5 * r * r / ((r + ha) * (r + ha)));
   let vc = sqrt(u.grav.x * enclosed / sqrt(r * r + u.grav.y));
-  let jitter = vec2f(rnd(&h) - 0.5, rnd(&h) - 0.5) * vc * 0.12;
+  var v = vec2f(0.0); // discs get their rotation from the measured field in spin()
+  if (kind == 3u) {
+    let b = rnd(&h) * 6.2831853;
+    v = vec2f(cos(b), sin(b)) * vc * 0.85; // halo: random orbits, no net spin
+  }
+  v += vec2f(rnd(&h) - 0.5, rnd(&h) - 0.5) * vc * disp * 2.0;
   pos[i] = g0.xy + d * r;
-  vel[i] = g0.zw + vec2f(-d.y, d.x) * vc * g1.z + jitter;
+  vel[i] = g0.zw + v;
+  // Young stars start with a spread of ages so the first frame is not one generation.
+  attr[i] = vec2f(f32(kind), -rnd(&h) * LIFE);
 }
 
 fn cellOf(p: vec2f) -> u32 {
@@ -80,13 +129,16 @@ fn cellOf(p: vec2f) -> u32 {
 
 @compute @workgroup_size(${WG})
 fn clear(@builtin(global_invocation_id) id: vec3u) {
-  if (id.x < u.gx * u.gy) { atomicStore(&mass[id.x], 0u); }
+  if (id.x < u.gx * u.gy) { atomicStore(&mass[id.x], 0u); atomicStore(&gas[id.x], 0u); }
 }
 
 @compute @workgroup_size(${WG})
 fn deposit(@builtin(global_invocation_id) id: vec3u) {
   if (id.x >= u.count) { return; }
-  atomicAdd(&mass[cellOf(pos[id.x])], 1u);
+  let c = cellOf(pos[id.x]);
+  let kind = u32(attr[id.x].x);
+  atomicAdd(&mass[c], select(1u, DM_WEIGHT, kind == 3u));
+  if (kind == 2u) { atomicAdd(&gas[c], 1u); }
 }
 
 // Gravity on the grid: every cell sums every other cell, tiled through workgroup memory.
@@ -115,7 +167,7 @@ fn gravity(@builtin(global_invocation_id) id: vec3u, @builtin(local_invocation_i
     }
     workgroupBarrier();
   }
-  if (id.x < cells) { field[id.x] = acc * (u.grav.x / f32(u.count)); }
+  if (id.x < cells) { field[id.x] = acc * (u.grav.x / (f32(u.count) * MEAN_W)); }
 }
 
 fn sampleField(p: vec2f) -> vec2f {
@@ -136,6 +188,9 @@ fn step(@builtin(global_invocation_id) id: vec3u) {
   if (i >= u.count) { return; }
   var p = pos[i];
   var v = vel[i];
+  var at = attr[i];
+  let kind = u32(at.x);
+  var h = pcg(i ^ u.seed);
 
   var a = sampleField(p);
 
@@ -146,7 +201,7 @@ fn step(@builtin(global_invocation_id) id: vec3u) {
     a += d * (u.well.z * ir * ir * ir);
   }
 
-  // Supernova: an expanding front that kicks stars outward as it passes.
+  // Supernova: an expanding front that kicks stars and gas outward as it passes.
   for (var k = 0u; k < ${SHOCKS}u; k++) {
     let s = u.shocks[k];
     if (s.w == 0.0) { continue; }
@@ -156,37 +211,131 @@ fn step(@builtin(global_invocation_id) id: vec3u) {
     a += d / r * (s.w * exp(-x * x) * exp(-s.z * 2.0));
   }
 
+  if (kind == 2u) {
+    // Gas is dissipative: it sheds random motion toward the local flow, which is why
+    // real discs keep thin, sharp gas arms while stars stay puffy.
+    let c = cellOf(p);
+    let dens = f32(atomicLoad(&gas[c]));
+    let mean = f32(u.count) * KIND_SHARE.z / f32(u.gx * u.gy);
+    // Star formation above a density threshold (Kennicutt–Schmidt-like: faster when denser).
+    let over = dens / max(mean, 1e-3);
+    if (over > 6.0 && rnd(&h) < (over - 6.0) * 0.004 * u.dt * 60.0) {
+      at = vec2f(1.0, u.time);
+    }
+  } else if (kind == 1u && u.time - at.y > LIFE) {
+    // End of the massive stars: a third returns to gas with a supernova kick, the rest
+    // are long-lived low-mass stars that join the old population.
+    if (rnd(&h) < 0.35) {
+      let b = rnd(&h) * 6.2831853;
+      v += vec2f(cos(b), sin(b)) * 0.08;
+      at = vec2f(2.0, u.time);
+    } else {
+      at = vec2f(0.0, at.y);
+    }
+  }
+
   // Soft leash past the screen edge, so escaping stars come home instead of vanishing.
-  let lim = vec2f(u.aspect, 1.0);
+  let lim = vec2f(u.aspect, 1.0) * 1.3;
   a -= sign(p) * max(abs(p) - lim, vec2f(0.0)) * 3.0;
 
   v += a * u.dt; // kick-drift: symplectic, keeps orbits from spiralling in or out
   p += v * u.dt;
   pos[i] = p;
   vel[i] = v;
+  attr[i] = at;
+}
+
+// Circular velocities from the force the grid actually produces, not from a formula:
+// mismatched starts make cold gas ring like a struck bell (concentric rings, not spirals).
+@compute @workgroup_size(${WG})
+fn spin(@builtin(global_invocation_id) id: vec3u) {
+  let i = id.x;
+  if (i >= u.count || u32(attr[i].x) == 3u) { return; }
+  var h = pcg(i ^ u.seed);
+  let pick = rnd(&h);
+  var k = 0u;
+  for (var j = 0u; j < u.ngal - 1u; j++) { if (pick > u.gal[j * 2u + 1u].y) { k = j + 1u; } }
+  let g0 = u.gal[k * 2u];
+  let d = pos[i] - g0.xy;
+  let r = max(length(d), 1e-4);
+  let inward = max(-dot(sampleField(pos[i]), d / r), 0.0);
+  let vc = sqrt(inward * r);
+  vel[i] += vec2f(-d.y, d.x) / r * vc * u.gal[k * 2u + 1u].z;
 }
 `;
 
 const DRAW_WGSL = U_WGSL + /* wgsl */ `
-struct R { gain: f32, exposure: f32, _p: vec2f };
+struct R { gain: f32, gasGain: f32, exposure: f32, time: f32, well: vec4f };
 @group(0) @binding(0) var<uniform> u: U;
 @group(0) @binding(1) var<storage, read> pos: array<vec2f>;
-@group(0) @binding(2) var<storage, read> vel: array<vec2f>;
+@group(0) @binding(2) var<storage, read> attr: array<vec2f>;
 @group(0) @binding(3) var<uniform> r: R;
 
-struct VO { @builtin(position) p: vec4f, @location(0) c: vec3f };
+struct VO { @builtin(position) p: vec4f, @location(0) c: vec4f };
 
-@vertex fn vs(@builtin(vertex_index) i: u32) -> VO {
-  let p = pos[i];
-  let s = length(vel[i]);
-  let bone = vec3f(0.91, 0.86, 0.76);
-  let sodium = vec3f(1.0, 0.36, 0.06);
+fn pcg(v: u32) -> u32 {
+  let s = v * 747796405u + 2891336453u;
+  let w = ((s >> ((s >> 28u) + 4u)) ^ s) * 277803737u;
+  return (w >> 22u) ^ w;
+}
+
+// Blackbody colour, linear RGB, normalised to unit luminance (fit to CIE 1931 / sRGB primaries).
+fn blackbody(t: f32) -> vec3f {
+  let k = clamp(t, 1500.0, 40000.0) / 100.0;
+  var c: vec3f;
+  c.r = select(1.0, clamp(1.2929 * pow(k - 60.0, -0.1332), 0.0, 1.0), k > 66.0);
+  c.g = select(clamp(0.3901 * log(k) - 0.6318, 0.0, 1.0), clamp(1.1299 * pow(k - 60.0, -0.0755), 0.0, 1.0), k > 66.0);
+  c.b = select(select(clamp(0.5432 * log(k - 10.0) - 1.1963, 0.0, 1.0), 0.0, k < 19.0), 1.0, k >= 66.0);
+  let lin = pow(c, vec3f(2.2));
+  return lin / max(dot(lin, vec3f(0.2126, 0.7152, 0.0722)), 1e-3);
+}
+
+const OFF = vec4f(2.0, 2.0, 0.0, 1.0); // outside clip space: culled
+
+fn starLight(i: u32, at: vec2f) -> vec3f {
+  let kind = u32(at.x);
+  let h = pcg(i * 9781u + 17u);
+  let x = f32(h & 0xffffu) / 65535.0;
+  var t: f32;
+  var lum: f32;
+  if (kind == 0u) {
+    // Old population: K and G dwarfs and red giants. Colour from a skewed temperature spread.
+    t = 3400.0 + 2800.0 * x * x;
+    lum = 0.6 + 1.4 * x * x * x;
+  } else {
+    // Young population: O/B stars dominate the light, then fade and redden as they age.
+    let age = clamp((u.time - at.y) / LIFE, 0.0, 1.0);
+    t = mix(9000.0 + 21000.0 * x, 6500.0, age);
+    lum = mix(4.0 + 12.0 * x * x, 1.2, sqrt(age));
+  }
+  return blackbody(t) * lum * r.gain;
+}
+
+// Full resolution: every star as a crisp point.
+@vertex fn stars(@builtin(vertex_index) i: u32) -> VO {
+  let at = attr[i];
   var o: VO;
+  if (u32(at.x) >= 2u) { o.p = OFF; return o; }
+  let p = pos[i];
   o.p = vec4f(p.x / u.aspect, p.y, 0.0, 1.0);
-  o.c = mix(bone * 0.35, sodium * 1.6, smoothstep(0.25, 1.6, s)) * r.gain;
+  o.c = vec4f(starLight(i, at), 0.0);
   return o;
 }
-@fragment fn fs(i: VO) -> @location(0) vec4f { return vec4f(i.c, 1.0); }
+
+// Quarter resolution: the same starlight (rgb) plus gas (a). Upsampled, this is the smooth
+// unresolved glow of a galaxy and the column density for dust and nebulae.
+@vertex fn glow(@builtin(vertex_index) i: u32) -> VO {
+  let at = attr[i];
+  let kind = u32(at.x);
+  var o: VO;
+  if (kind == 3u) { o.p = OFF; return o; }
+  let p = pos[i];
+  o.p = vec4f(p.x / u.aspect, p.y, 0.0, 1.0);
+  o.c = select(vec4f(starLight(i, at), 0.0), vec4f(0.0, 0.0, 0.0, r.gasGain), kind == 2u);
+  return o;
+}
+
+@fragment fn fs(i: VO) -> @location(0) vec4f { return i.c; }
 `;
 
 const FULL_VS = /* wgsl */ `
@@ -197,20 +346,80 @@ const FULL_VS = /* wgsl */ `
 }
 `;
 
-// Multiplies the HDR target by the blend constant: cheap motion trails, no ping-pong.
-const FADE_WGSL = FULL_VS + /* wgsl */ `
-@fragment fn fs() -> @location(0) vec4f { return vec4f(0.0); }
-`;
-
+// Compositing: dust extinction and H-II emission from the gas map, a sky of distant
+// galaxies, gravitational lensing around the black hole, then a filmic curve.
 const TONE_WGSL = FULL_VS + /* wgsl */ `
-struct R { gain: f32, exposure: f32, _p: vec2f };
-@group(0) @binding(0) var hdr: texture_2d<f32>;
-@group(0) @binding(1) var<uniform> r: R;
+struct R { gain: f32, gasGain: f32, exposure: f32, time: f32, well: vec4f }; // well: px xy, Einstein radius px, -
+@group(0) @binding(0) var light: texture_2d<f32>;
+@group(0) @binding(1) var glowMap: texture_2d<f32>;
+@group(0) @binding(2) var lin: sampler;
+@group(0) @binding(3) var<uniform> r: R;
+
+fn hash2(p: vec2f) -> vec2f {
+  let q = vec2f(dot(p, vec2f(127.1, 311.7)), dot(p, vec2f(269.5, 183.3)));
+  return fract(sin(q) * 43758.5453);
+}
+
+// Faint field galaxies: sparse, tiny, mostly yellow-white ellipticals and a few blue spirals.
+fn sky(px: vec2f) -> vec3f {
+  let cell = 22.0;
+  let g = floor(px / cell);
+  var col = vec3f(0.0);
+  for (var y = -1; y <= 1; y++) {
+    for (var x = -1; x <= 1; x++) {
+      let c = g + vec2f(f32(x), f32(y));
+      let h = hash2(c);
+      if (h.x > 0.11) { continue; }
+      let h2 = hash2(c + 31.7);
+      let centre = (c + h2) * cell;
+      let ang = h.y * 6.283;
+      let d = px - centre;
+      let rot = vec2f(d.x * cos(ang) + d.y * sin(ang), -d.x * sin(ang) + d.y * cos(ang));
+      let size = 0.6 + h2.x * 1.6;
+      let q = rot / vec2f(size, size * (0.35 + h2.y * 0.65));
+      let tint = select(vec3f(1.0, 0.85, 0.65), vec3f(0.7, 0.8, 1.0), h.x < 0.03);
+      col += tint * exp(-dot(q, q)) * (0.004 + 0.02 * h2.y * h2.y);
+    }
+  }
+  return col;
+}
+
+fn filmic(x: vec3f) -> vec3f { // ACES fit (Narkowicz)
+  return clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), vec3f(0.0), vec3f(1.0));
+}
+
 @fragment fn fs(@builtin(position) fc: vec4f) -> @location(0) vec4f {
-  let h = textureLoad(hdr, vec2i(fc.xy), 0).rgb;
-  let ink = vec3f(0.071, 0.063, 0.051);
-  let c = 1.0 - exp(-h * r.exposure);
-  return vec4f(ink + c * (1.0 - ink), 1.0);
+  let size = vec2f(textureDimensions(light));
+  var px = fc.xy;
+  // Point-mass lens: light from behind bends toward the hole; inside the Einstein ring
+  // the image flips, and the shadow at the centre stays black.
+  var shadow = 1.0;
+  if (r.well.z > 0.0) {
+    let d = px - r.well.xy;
+    let d2 = max(dot(d, d), 1.0);
+    px = px - d * (r.well.z * r.well.z / d2);
+    shadow = smoothstep(0.35, 0.55, sqrt(d2) / r.well.z);
+  }
+  let uv = px / size;
+  // Most of a galaxy's light is unresolved stars: mix each crisp point with the quarter-res
+  // glow map (tent-filtered upsample), so sparse counts read as smooth light, not glitter.
+  let q = 1.0 / vec2f(textureDimensions(glowMap));
+  let gl = (textureSampleLevel(glowMap, lin, uv, 0.0) * 2.0
+          + textureSampleLevel(glowMap, lin, uv + vec2f(q.x, 0.0), 0.0) + textureSampleLevel(glowMap, lin, uv - vec2f(q.x, 0.0), 0.0)
+          + textureSampleLevel(glowMap, lin, uv + vec2f(0.0, q.y), 0.0) + textureSampleLevel(glowMap, lin, uv - vec2f(0.0, q.y), 0.0)) / 6.0;
+  let sharp = textureSampleLevel(light, lin, uv, 0.0).rgb;
+  var c = sharp * 0.3 + gl.rgb * (0.7 / 16.0);
+  let gasD = gl.a / 16.0;
+  // H-II regions: gas lit up by hot young stars. H-alpha red plus H-beta/[O III] blue reads pink.
+  // Young light is what is bluer than the old population, so ionisation follows the blue excess.
+  let young = max(gl.b - gl.r * 0.75, 0.0) / 16.0;
+  c += vec3f(1.0, 0.3, 0.5) * young * min(gasD, 3.0) * 0.6;
+  // Dust: reddening extinction, stronger in blue (roughly R_V = 3.1).
+  c *= exp(-gasD * vec3f(0.5, 0.7, 1.0) * 0.9);
+  c += sky(px);
+  c *= shadow;
+  let mapped = filmic(c * r.exposure);
+  return vec4f(pow(mapped, vec3f(1.0 / 2.2)), 1.0);
 }
 `;
 
@@ -243,28 +452,34 @@ async function boot() {
 
   const simMod = device.createShaderModule({ code: SIM_WGSL });
   const drawMod = device.createShaderModule({ code: DRAW_WGSL });
-  const fadeMod = device.createShaderModule({ code: FADE_WGSL });
   const toneMod = device.createShaderModule({ code: TONE_WGSL });
 
   const storage = (i) => ({ binding: i, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } });
   const simLayout = device.createBindGroupLayout({
-    entries: [{ binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: "uniform" } }, storage(1), storage(2), storage(3), storage(4)],
+    entries: [{ binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: "uniform" } }, storage(1), storage(2), storage(3), storage(4), storage(5), storage(6)],
   });
   const simPL = device.createPipelineLayout({ bindGroupLayouts: [simLayout] });
   const cp = (entryPoint) => device.createComputePipeline({ layout: simPL, compute: { module: simMod, entryPoint } });
-  const seedPipe = cp("seed"), clearPipe = cp("clear"), depositPipe = cp("deposit"), gravityPipe = cp("gravity"), stepPipe = cp("step");
+  const seedPipe = cp("seed"), clearPipe = cp("clear"), depositPipe = cp("deposit"), gravityPipe = cp("gravity"), stepPipe = cp("step"), spinPipe = cp("spin");
   const blend = (srcFactor, dstFactor) => ({ color: { srcFactor, dstFactor, operation: "add" }, alpha: { srcFactor, dstFactor, operation: "add" } });
-  const drawPipe = device.createRenderPipeline({
-    layout: "auto",
-    vertex: { module: drawMod, entryPoint: "vs" },
-    fragment: { module: drawMod, entryPoint: "fs", targets: [{ format: HDR, blend: blend("one", "one") }] },
+  const drawLayout = device.createBindGroupLayout({
+    entries: [
+      { binding: 0, visibility: GPUShaderStage.VERTEX, buffer: { type: "uniform" } },
+      { binding: 1, visibility: GPUShaderStage.VERTEX, buffer: { type: "read-only-storage" } },
+      { binding: 2, visibility: GPUShaderStage.VERTEX, buffer: { type: "read-only-storage" } },
+      { binding: 3, visibility: GPUShaderStage.VERTEX, buffer: { type: "uniform" } },
+    ],
+  });
+  const drawPL = device.createPipelineLayout({ bindGroupLayouts: [drawLayout] });
+  const points = (entryPoint, fmt) => device.createRenderPipeline({
+    layout: drawPL,
+    vertex: { module: drawMod, entryPoint },
+    fragment: { module: drawMod, entryPoint: "fs", targets: [{ format: fmt, blend: blend("one", "one") }] },
     primitive: { topology: "point-list" },
   });
-  const fadePipe = device.createRenderPipeline({
-    layout: "auto",
-    vertex: { module: fadeMod, entryPoint: "vs" },
-    fragment: { module: fadeMod, entryPoint: "fs", targets: [{ format: HDR, blend: blend("zero", "constant") }] },
-  });
+  const starPipe = points("stars", HDR);
+  const glowPipe = points("glow", "rgba16float");
+  const sampler = device.createSampler({ magFilter: "linear", minFilter: "linear" });
   const tonePipe = device.createRenderPipeline({
     layout: "auto",
     vertex: { module: toneMod, entryPoint: "vs" },
@@ -280,13 +495,13 @@ async function boot() {
   const U_SIZE = 32 + 16 + 16 * SHOCKS + 32 * GALAXIES + 16;
   const O_WELL = 8, O_SHOCK = 12, O_GAL = O_SHOCK + 4 * SHOCKS, O_GRAV = O_GAL + 8 * GALAXIES;
   const uBuf = device.createBuffer({ size: U_SIZE, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-  const rBuf = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+  const rBuf = device.createBuffer({ size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
   const uData = new ArrayBuffer(U_SIZE);
   const uF = new Float32Array(uData);
   const uU = new Uint32Array(uData);
 
   const state = {
-    n: Math.min(cap, coarse ? 1 << 15 : 1 << 16), // start light, grow only while the GPU has headroom
+    n: Math.min(cap, FIXED_N || (coarse ? 1 << 15 : 1 << 16)), // start light, grow only while the GPU has headroom
     scale: 1, // internal render resolution, dropped only if the minimum count still misses budget
     time: 0,
     aspect: 1,
@@ -304,14 +519,23 @@ async function boot() {
   const maxCells = GRID * GRID * 4; // up to 4:1 aspect
   const massBuf = device.createBuffer({ size: maxCells * 4, usage });
   const fieldBuf = device.createBuffer({ size: maxCells * 8, usage });
+  const gasBuf = device.createBuffer({ size: maxCells * 4, usage });
+  const attr = device.createBuffer({ size: cap * 8, usage });
   const base = [{ binding: 0, resource: { buffer: uBuf } }, { binding: 1, resource: { buffer: pos } }, { binding: 2, resource: { buffer: vel } }];
   const simBG = device.createBindGroup({
     layout: simLayout,
-    entries: [...base, { binding: 3, resource: { buffer: massBuf } }, { binding: 4, resource: { buffer: fieldBuf } }],
+    entries: [
+      ...base, { binding: 3, resource: { buffer: massBuf } }, { binding: 4, resource: { buffer: fieldBuf } },
+      { binding: 5, resource: { buffer: attr } }, { binding: 6, resource: { buffer: gasBuf } },
+    ],
   });
-  const drawBG = device.createBindGroup({ layout: drawPipe.getBindGroupLayout(0), entries: [...base, { binding: 3, resource: { buffer: rBuf } }] });
+  const drawBG = device.createBindGroup({
+    layout: drawLayout,
+    entries: [base[0], base[1], { binding: 2, resource: { buffer: attr } }, { binding: 3, resource: { buffer: rBuf } }],
+  });
   let gx = GRID;
-  let hdr, toneBG;
+  let hdr, glowTex, toneBG;
+  const rData = new Float32Array(8);
 
   // A random encounter: two or three discs on a slow, slightly offset collision course.
   function galaxies() {
@@ -323,13 +547,13 @@ async function boot() {
     let total = 0;
     for (let k = 0; k < count; k++) {
       const t = count === 2 ? (k ? 1 : -1) : k - 1;
-      const along = t * span * 0.5, off = (Math.random() - 0.5) * 0.5 * unit;
+      const along = t * span * 0.6, off = (Math.random() - 0.5) * 0.5 * unit;
       const c = wide ? [along, off] : [off, along];
       const speed = 0.1 + Math.random() * 0.08;
       const v = wide ? [-t * speed, (Math.random() - 0.5) * 0.15] : [(Math.random() - 0.5) * 0.15, -t * speed];
       const m = 0.5 + Math.random() * 0.5;
       total += m;
-      gs.push({ c, v, m, rd: (0.06 + Math.random() * 0.04) * unit * (0.6 + m * 0.6), spin: Math.random() < 0.5 ? -1 : 1 });
+      gs.push({ c, v, m, rd: (0.07 + Math.random() * 0.04) * unit * (0.6 + m * 0.6), spin: Math.random() < 0.5 ? -1 : 1 });
     }
     let cum = 0;
     gs.forEach((g, k) => {
@@ -348,20 +572,24 @@ async function boot() {
     device.queue.writeBuffer(uBuf, 0, uData);
     const enc = device.createCommandEncoder();
     const pass = enc.beginComputePass();
-    pass.setPipeline(seedPipe);
     pass.setBindGroup(0, simBG);
-    pass.dispatchWorkgroups(Math.ceil(cap / WG));
+    const groups = Math.ceil(cap / WG), cells = gx * GRID;
+    pass.setPipeline(seedPipe); pass.dispatchWorkgroups(groups);
+    pass.setPipeline(clearPipe); pass.dispatchWorkgroups(Math.ceil(cells / WG));
+    pass.setPipeline(depositPipe); pass.dispatchWorkgroups(groups);
+    pass.setPipeline(gravityPipe); pass.dispatchWorkgroups(Math.ceil(cells / 64));
+    pass.setPipeline(spinPipe); pass.dispatchWorkgroups(groups);
     pass.end();
     device.queue.submit([enc.finish()]);
     state.time = 0;
   }
 
-  // Keep total brightness roughly constant regardless of count, screen size and trail length.
+  // Keep surface brightness constant regardless of particle count and screen size.
   function exposure() {
     const px = canvas.width * canvas.height || 1;
-    const gain = Math.min(0.35, (0.2 * px * (1 - TRAIL)) / state.n);
-    device.queue.writeBuffer(rBuf, 0, new Float32Array([gain, 1.5, 0, 0]));
-    $("n").textContent = fmt(state.n);
+    rData[0] = (0.25 * px) / state.n;
+    rData[1] = (0.6 * px) / state.n;
+    rData[2] = 0.32;
   }
 
   function resize() {
@@ -373,11 +601,16 @@ async function boot() {
     canvas.width = w; canvas.height = h;
     state.aspect = w / h;
     gx = Math.max(8, Math.min(GRID * 4, Math.round(GRID * state.aspect)));
-    hdr?.destroy();
-    hdr = device.createTexture({ size: [w, h], format: HDR, usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING });
+    hdr?.destroy(); glowTex?.destroy();
+    const tex = GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING;
+    hdr = device.createTexture({ size: [w, h], format: HDR, usage: tex });
+    glowTex = device.createTexture({ size: [Math.ceil(w / 4), Math.ceil(h / 4)], format: "rgba16float", usage: tex });
     toneBG = device.createBindGroup({
       layout: tonePipe.getBindGroupLayout(0),
-      entries: [{ binding: 0, resource: hdr.createView() }, { binding: 1, resource: { buffer: rBuf } }],
+      entries: [
+        { binding: 0, resource: hdr.createView() }, { binding: 1, resource: glowTex.createView() },
+        { binding: 2, resource: sampler }, { binding: 3, resource: { buffer: rBuf } },
+      ],
     });
     exposure();
   }
@@ -390,6 +623,12 @@ async function boot() {
     // The black hole grows over a hold, so a tap is a supernova and not a tug.
     const held = state.down || state.keys.size ? Math.min(1, (now - state.downAt) / 600) : 0;
     uF.set([state.ptr[0], state.ptr[1], 0.12 * held, 0], O_WELL);
+    uU[4] = (now * 1000) >>> 0; // per-frame randomness for star formation and supernovae
+    // Lens: Einstein radius grows with the hole's mass (sqrt), in screen pixels.
+    rData[3] = state.time;
+    rData[4] = ((state.ptr[0] / state.aspect + 1) / 2) * canvas.width;
+    rData[5] = ((1 - state.ptr[1]) / 2) * canvas.height;
+    rData[6] = held > 0 ? Math.sqrt(held) * 0.045 * canvas.height : 0;
     state.shocks = state.shocks.filter((s) => now - s.born < 2000);
     for (let k = 0; k < SHOCKS; k++) {
       const s = state.shocks[k];
@@ -499,17 +738,21 @@ async function boot() {
       pass.end();
     }
 
+    device.queue.writeBuffer(rBuf, 0, rData);
+    const clear = { r: 0, g: 0, b: 0, a: 0 };
     const rp = enc.beginRenderPass({
-      colorAttachments: [{ view: hdr.createView(), loadOp: "load", storeOp: "store" }],
+      colorAttachments: [{ view: hdr.createView(), loadOp: "clear", clearValue: clear, storeOp: "store" }],
       ...(timed && !steps ? { timestampWrites: { querySet: qs, beginningOfPassWriteIndex: 0 } } : {}),
     });
-    rp.setPipeline(fadePipe);
-    rp.setBlendConstant([TRAIL, TRAIL, TRAIL, TRAIL]);
-    rp.draw(3);
-    rp.setPipeline(drawPipe);
+    rp.setPipeline(starPipe);
     rp.setBindGroup(0, drawBG);
     rp.draw(state.n);
     rp.end();
+    const gp = enc.beginRenderPass({ colorAttachments: [{ view: glowTex.createView(), loadOp: "clear", clearValue: clear, storeOp: "store" }] });
+    gp.setPipeline(glowPipe);
+    gp.setBindGroup(0, drawBG);
+    gp.draw(state.n);
+    gp.end();
 
     const tp = enc.beginRenderPass({
       colorAttachments: [{ view: ctx.getCurrentTexture().createView(), loadOp: "clear", storeOp: "store", clearValue: { r: 0, g: 0, b: 0, a: 1 } }],
@@ -545,17 +788,24 @@ async function boot() {
     if (now - winT > 500) {
       winT = now;
       let n = state.n;
-      if (gpuMs > BUDGET) {
+      if (FIXED_N) {
+        // pinned: no adaptation
+      } else if (gpuMs > BUDGET) {
         if (n > MIN_N) n = Math.max(MIN_N, Math.round(n * 0.6));
         else if (state.scale > 0.5) { state.scale -= 0.25; resize(); }
       } else if (gpuMs < BUDGET * 0.5 && n < cap) n = Math.min(cap, Math.round(n * 1.25));
       if (n !== state.n) { state.n = n; exposure(); }
-      $("n").textContent = `${fmt(state.n)} · ${gpuMs.toFixed(1)}ms`;
+      $("n").textContent = `${fmt(state.n)} · ${gpuMs.toFixed(1)}ms · ${age(state.time)}`;
     }
   }
   requestAnimationFrame(frame);
 
   if (!store.get("pp.tut4")) tutorial.start();
+}
+
+function age(t) {
+  const myr = t * MYR_PER_SEC;
+  return myr >= 1000 ? (myr / 1000).toFixed(2) + " Gyr" : Math.round(myr) + " Myr";
 }
 
 function fmt(n) {
@@ -569,7 +819,9 @@ const time = (() => {
   const sync = () => {
     pause.setAttribute("aria-pressed", String(paused));
     const r = 2 ** Number(slider.value);
-    slider.setAttribute("aria-valuetext", r >= 1 ? `${r}x` : `1/${Math.round(1 / r)}x`);
+    const label = `${Math.round(r * MYR_PER_SEC)} Myr/s`;
+    slider.setAttribute("aria-valuetext", label);
+    $("myr").textContent = paused ? "0 Myr/s" : label;
   };
   slider.addEventListener("input", () => { paused = false; sync(); tutorial.done("time"); });
   pause.onclick = () => api.toggle();

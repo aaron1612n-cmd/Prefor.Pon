@@ -1,6 +1,22 @@
 # Prefor.Pon
 
-A WebGPU galaxy simulation: colliding spiral galaxies under self-gravity, running entirely on the GPU. Up to 4M particles (1M on phones), one compute dispatch per physics substep, one draw call.
+A WebGPU galaxy simulation: colliding spiral galaxies under self-gravity, running entirely on the GPU, rendered to look like a telescope image.
+
+## Physics
+
+- **Four particle kinds:** old stars, young stars, gas and dark matter. Each galaxy is an exponential disc with a bulge, inside a Hernquist dark-matter halo that holds about 3.4x the visible mass.
+- **Disc rotation from the measured field.** After seeding, one gravity solve runs and every disc particle gets the circular speed that the grid force actually gives at its position. A mismatched start makes cold gas ring in concentric waves.
+- **Spiral density waves seeded:** a two-armed logarithmic spiral with a pitch of about 15°, strongest in gas and young stars.
+- **Star formation and feedback.** Gas above about 6x the mean local gas density turns into young stars, faster the denser it is. After about 70 Myr, a third of the young stars go supernova and return to gas with a kick, and the rest join the old population. Mergers trigger starbursts and use up the gas.
+- **Units:** 1 length unit is 25 kpc and 1 sim second is 150 Myr. The time control shows Myr per second, and the readout shows the elapsed time.
+
+## Rendering
+
+- **Star colours** are blackbody colours. Old stars range from 3400 to 6200 K. Young stars start at 9000 to 30000 K, then cool and fade over their lifetime.
+- **Two light layers.** Crisp full-resolution points sit over a quarter-resolution glow map, which is the unresolved starlight, so sparse counts read as smooth light.
+- **Dust and nebulae.** The gas column density dims the light, more in blue than red (R_V of about 3.1). Pink H-II emission appears where gas overlaps young blue light.
+- **Lensing.** The finger black hole lenses everything behind it, with an Einstein radius proportional to the square root of its mass and a black shadow at the centre. Behind everything is a faint sky of distant galaxies.
+- **Tone mapping** is the ACES filmic curve, so cores roll off instead of blowing out to flat white. Up to 2M particles (512K on phones). Add `?n=262144` to the URL to pin the count, one compute dispatch per physics substep, one draw call.
 
 ## How it stays fast
 
