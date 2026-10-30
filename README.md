@@ -5,6 +5,8 @@ A WebGPU galaxy simulation: colliding spiral galaxies under self-gravity, runnin
 ## Physics
 
 - **Four particle kinds:** old stars, young stars, gas and dark matter. Each galaxy is an exponential disc with a bulge, inside a Hernquist dark-matter halo that holds about 3.4x the visible mass.
+- **Galaxy types.** There are spirals, barred spirals (a straight bar inside about 1.6 scale lengths), ellipticals (hot spheroids of old stars with no gas or rotation) and dwarf irregulars (gas-rich, puffy, with no bulge). Each big galaxy carries a dozen globular clusters on random halo orbits.
+- **Presets.** The first view is the Local Group: the Milky Way (barred) and Andromeda (about 1.5x heavier) on their head-on approach, with the LMC, Triangulum (M33) and M110. Positions are compressed to fit the screen, while sizes, mass ratios and types follow the real galaxies. ↻ deals random encounters, often with a satellite dwarf, and L brings the Local Group back.
 - **Disc rotation from the measured field.** After seeding, one gravity solve runs and every disc particle gets the circular speed that the grid force actually gives at its position. A mismatched start makes cold gas ring in concentric waves.
 - **Spiral density waves seeded:** a two-armed logarithmic spiral with a pitch of about 15°, strongest in gas and young stars.
 - **Star formation and feedback.** Gas above about 6x the mean local gas density turns into young stars, faster the denser it is. After about 70 Myr, a third of the young stars go supernova and return to gas with a kick, and the rest join the old population. Mergers trigger starbursts and use up the gas.
@@ -38,6 +40,7 @@ A WebGPU galaxy simulation: colliding spiral galaxies under self-gravity, runnin
 | Hold (touch or mouse) | A black hole grows under your finger |
 | Tap / Space | Supernova: a shock ring blows stars outward |
 | ↻ / R | A new random encounter of two or three galaxies |
+| L | The Local Group preset |
 | Arrow keys | Move the black hole with the keyboard |
 | Pause glyph / P | Pause and resume time |
 | Slider / , . | Time rate, from 1/8x to 4x (starts at 1/2x) |

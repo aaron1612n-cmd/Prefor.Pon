@@ -9,7 +9,8 @@ const DT = 1 / 60; // fixed physics step
 const MAX_SUBSTEPS = 2; // more substeps on a slow frame only makes the next frame slower
 const WG = 256;
 const SHOCKS = 4;
-const GALAXIES = 3;
+const GALAXIES = 5;
+const SPIRAL = 0, BARRED = 1, ELLIPTICAL = 2, DWARF = 3;
 const GRID = coarse ? 40 : 56; // gravity grid rows; columns follow the aspect ratio
 const G = 0.5;
 // ?n=262144 pins the particle count (for benchmarking and comparing looks); otherwise it adapts.
@@ -29,7 +30,7 @@ struct U {
   seed: u32, gx: u32, gy: u32, ngal: u32,
   well: vec4f,                     // xy pos, z = G*M of the black hole under the finger
   shocks: array<vec4f, ${SHOCKS}>, // xy origin, z age, w strength
-  gal: array<vec4f, ${GALAXIES * 2}>, // per galaxy: (cx, cy, vx, vy), (disc scale, cumulative share, spin, mass)
+  gal: array<vec4f, ${GALAXIES * 3}>, // per galaxy: (cx, cy, vx, vy), (scale, cumulative share, spin, mass), (type, phase, -, -)
   grav: vec4f,                     // G, softening^2, cell w, cell h
 };
 const KIND_SHARE = vec4f(${KIND_SHARE.join(", ")});
@@ -65,59 +66,97 @@ fn kindOf(x: f32) -> u32 {
   return 3u;
 }
 
-// Exponential disc of stars and gas inside a Hernquist dark halo, on near-circular orbits.
+fn galaxyOf(pick: f32) -> u32 {
+  var k = 0u;
+  for (var j = 0u; j < u.ngal - 1u; j++) { if (pick > u.gal[j * 3u + 1u].y) { k = j + 1u; } }
+  return k;
+}
+
+const CLUSTER = -100.0; // birth-time marker for globular-cluster stars: they keep their seeded orbit
+
+// Galaxy types: 0 spiral, 1 barred spiral, 2 elliptical, 3 dwarf irregular.
+// Discs are exponential, with a bulge, inside a Hernquist dark halo; ellipticals are hot
+// spheroids of old stars with no gas; dwarfs are gas-rich with no bulge.
 @compute @workgroup_size(${WG})
 fn seed(@builtin(global_invocation_id) id: vec3u) {
   let i = id.x;
   if (i >= u.count) { return; }
   var h = pcg(i ^ u.seed);
-  let pick = rnd(&h);
-  var k = 0u;
-  for (var j = 0u; j < u.ngal - 1u; j++) { if (pick > u.gal[j * 2u + 1u].y) { k = j + 1u; } }
-  let g0 = u.gal[k * 2u];
-  let g1 = u.gal[k * 2u + 1u];
+  let k = galaxyOf(rnd(&h));
+  let g0 = u.gal[k * 3u];
+  let g1 = u.gal[k * 3u + 1u];
+  let g2 = u.gal[k * 3u + 2u];
+  let gtype = u32(g2.x);
   let rd = g1.x;
   let ha = rd * 6.0; // halo scale: diffuse enough that the disc's own gravity can grow spiral arms
   let mb = g1.w * 0.7 / MEAN_W;
   let mh = g1.w - mb;
   var kind = kindOf(rnd(&h));
+  if (gtype == 2u && kind != 3u) { kind = 0u; }               // ellipticals: red and dead
+  if (gtype == 3u && kind == 0u && rnd(&h) < 0.4) { kind = 2u; } // dwarfs: gas-rich
 
   let a = rnd(&h) * 6.2831853;
   var r: f32;
   var disp = 0.05; // velocity dispersion as a fraction of circular speed: gas and young stars are cold
+  var hot = false;  // pressure-supported: random orbits, no disc rotation
+  var birth = -rnd(&h) * LIFE; // young stars start with a spread of ages
+  var centre = g0.xy;
+  var orbit = vec2f(0.0);
   if (kind == 3u) {
     let s = sqrt(rnd(&h) * 0.4); // Hernquist, truncated at 40% of its mass (~1.7 scale radii)
     r = ha * s / (1.0 - s);
-  } else if (kind == 0u && rnd(&h) < 0.35) {
+    hot = true;
+  } else if (gtype == 2u) {
+    let s = sqrt(rnd(&h) * 0.85); // de Vaucouleurs-like: Hernquist with scale ~ rd/2
+    r = rd * 0.5 * s / (1.0 - s);
+    hot = true;
+  } else if (kind == 0u && gtype != 3u && rnd(&h) < 0.006) {
+    // Globular clusters: a dozen tight, old clumps on random halo orbits.
+    let c = u32(rnd(&h) * 12.0);
+    var hc = pcg(k * 977u + c * 131u + u.seed);
+    let cr = rd * (1.5 + 5.0 * rnd(&hc));
+    let ca = rnd(&hc) * 6.2831853;
+    centre = g0.xy + vec2f(cos(ca), sin(ca)) * cr;
+    let cx = cr / rd;
+    let cm = mb * (1.0 - (1.0 + cx) * exp(-cx)) + mh * min(1.0, 2.5 * cr * cr / ((cr + ha) * (cr + ha)));
+    let ob = rnd(&hc) * 6.2831853;
+    orbit = vec2f(cos(ob), sin(ob)) * sqrt(u.grav.x * cm / cr) * 0.8;
+    r = rd * 0.04 * sqrt(-2.0 * log(rnd(&h)));
+    disp = 0.0;
+    birth = CLUSTER;
+  } else if (kind == 0u && gtype != 3u && rnd(&h) < 0.35) {
     r = rd * 0.3 * sqrt(-2.0 * log(rnd(&h))); // bulge: old and hot
     disp = 0.6;
   } else {
     r = -rd * log(rnd(&h) * rnd(&h));
     if (r > rd * 6.0) { r = rd * 6.0 * rnd(&h); } // re-draw the far tail instead of piling it on a ring
     if (kind == 0u) { disp = 0.12; }
+    if (gtype == 3u) { disp = 0.25; } // dwarfs: puffy and irregular
   }
-  // Seed a two-armed logarithmic spiral (pitch ~15°) in the disc: real discs carry density waves,
-  // and a smooth start would take far longer than the encounter to grow its own.
+  // Seed a two-armed logarithmic spiral (pitch ~15°): real discs carry density waves, and a
+  // smooth start would take longer than the encounter to grow its own. Barred spirals also get
+  // a straight bar inside ~1.6 scale lengths that the arms grow from.
   var th = a;
-  if (kind != 3u && disp < 0.5) {
+  if (!hot && disp < 0.5 && birth != CLUSTER && gtype <= 1u) {
     let amp = select(select(0.9, 0.7, kind == 1u), 0.3, kind == 0u);
-    let phase = log(max(r, 1e-3) / rd) / 0.27;
-    th = a - 0.5 * amp * sin(2.0 * (a - phase));
+    var phase = log(max(r, 1e-3) / rd) / 0.27 + g2.y;
+    var w = amp;
+    if (gtype == 1u && r < rd * 1.6) { phase = g2.y; w = 0.95; }
+    th = a - 0.5 * w * sin(2.0 * (a - phase));
   }
   let d = vec2f(cos(th), sin(th));
   let x = r / rd;
   let enclosed = mb * (1.0 - (1.0 + x) * exp(-x)) + mh * min(1.0, 2.5 * r * r / ((r + ha) * (r + ha)));
   let vc = sqrt(u.grav.x * enclosed / sqrt(r * r + u.grav.y));
-  var v = vec2f(0.0); // discs get their rotation from the measured field in spin()
-  if (kind == 3u) {
+  var v = orbit; // discs get their rotation from the measured field in spin()
+  if (hot) {
     let b = rnd(&h) * 6.2831853;
-    v = vec2f(cos(b), sin(b)) * vc * 0.85; // halo: random orbits, no net spin
+    v = vec2f(cos(b), sin(b)) * vc * 0.85; // random orbits, no net spin
   }
   v += vec2f(rnd(&h) - 0.5, rnd(&h) - 0.5) * vc * disp * 2.0;
-  pos[i] = g0.xy + d * r;
+  pos[i] = centre + d * r;
   vel[i] = g0.zw + v;
-  // Young stars start with a spread of ages so the first frame is not one generation.
-  attr[i] = vec2f(f32(kind), -rnd(&h) * LIFE);
+  attr[i] = vec2f(f32(kind), birth);
 }
 
 fn cellOf(p: vec2f) -> u32 {
@@ -250,17 +289,16 @@ fn step(@builtin(global_invocation_id) id: vec3u) {
 @compute @workgroup_size(${WG})
 fn spin(@builtin(global_invocation_id) id: vec3u) {
   let i = id.x;
-  if (i >= u.count || u32(attr[i].x) == 3u) { return; }
+  if (i >= u.count || u32(attr[i].x) == 3u || attr[i].y == CLUSTER) { return; }
   var h = pcg(i ^ u.seed);
-  let pick = rnd(&h);
-  var k = 0u;
-  for (var j = 0u; j < u.ngal - 1u; j++) { if (pick > u.gal[j * 2u + 1u].y) { k = j + 1u; } }
-  let g0 = u.gal[k * 2u];
+  let k = galaxyOf(rnd(&h));
+  if (u32(u.gal[k * 3u + 2u].x) == 2u) { return; } // ellipticals do not rotate
+  let g0 = u.gal[k * 3u];
   let d = pos[i] - g0.xy;
   let r = max(length(d), 1e-4);
   let inward = max(-dot(sampleField(pos[i]), d / r), 0.0);
   let vc = sqrt(inward * r);
-  vel[i] += vec2f(-d.y, d.x) / r * vc * u.gal[k * 2u + 1u].z;
+  vel[i] += vec2f(-d.y, d.x) / r * vc * u.gal[k * 3u + 1u].z;
 }
 `;
 
@@ -492,8 +530,8 @@ async function boot() {
   const qResolve = timed && device.createBuffer({ size: 16, usage: GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC });
   const qRead = timed && device.createBuffer({ size: 16, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
 
-  const U_SIZE = 32 + 16 + 16 * SHOCKS + 32 * GALAXIES + 16;
-  const O_WELL = 8, O_SHOCK = 12, O_GAL = O_SHOCK + 4 * SHOCKS, O_GRAV = O_GAL + 8 * GALAXIES;
+  const U_SIZE = 32 + 16 + 16 * SHOCKS + 48 * GALAXIES + 16;
+  const O_WELL = 8, O_SHOCK = 12, O_GAL = O_SHOCK + 4 * SHOCKS, O_GRAV = O_GAL + 12 * GALAXIES;
   const uBuf = device.createBuffer({ size: U_SIZE, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
   const rBuf = device.createBuffer({ size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
   const uData = new ArrayBuffer(U_SIZE);
@@ -537,36 +575,71 @@ async function boot() {
   let hdr, glowTex, toneBG;
   const rData = new Float32Array(8);
 
-  // A random encounter: two or three discs on a slow, slightly offset collision course.
-  function galaxies() {
-    const count = Math.random() < 0.35 ? 3 : 2;
-    const wide = state.aspect >= 1;
-    const span = wide ? Math.min(state.aspect, 1.6) : 1;
+  // Encounters. Units: 1 length unit = 25 kpc, so positions are compressed to fit the screen,
+  // but sizes, mass ratios, types and approach geometry follow the real systems.
+  const presets = {
+    // The Local Group: Milky Way (barred Sbc) and Andromeda (Sb, ~1.5x heavier) on their
+    // head-on approach, with the LMC, Triangulum (M33) and M110 (dwarf elliptical) in tow.
+    local(unit, wide) {
+      const along = (x, y) => (wide ? [x, y] : [y, x]);
+      const mw = { c: along(-0.75, -0.1), v: along(0.12, 0.02), m: 1.0, rd: 0.075 * unit, spin: 1, type: BARRED };
+      const m31 = { c: along(0.7, 0.12), v: along(-0.1, -0.015), m: 1.5, rd: 0.1 * unit, spin: -1, type: SPIRAL, phase: 1.2 };
+      return [
+        mw, m31,
+        satellite(mw, 0.32 * unit, 0.4, { m: 0.1, rd: 0.025 * unit, type: DWARF }),       // LMC
+        satellite(m31, 0.55 * unit, 2.6, { m: 0.12, rd: 0.035 * unit, type: SPIRAL, spin: 1 }), // M33
+        satellite(m31, 0.22 * unit, 4.4, { m: 0.03, rd: 0.02 * unit, type: ELLIPTICAL }),  // M110
+      ];
+    },
+    random(unit, wide, aspect) {
+      const count = Math.random() < 0.35 ? 3 : 2;
+      const span = wide ? Math.min(aspect, 1.6) : 1;
+      const gs = [];
+      for (let k = 0; k < count; k++) {
+        const t = count === 2 ? (k ? 1 : -1) : k - 1;
+        const along = t * span * 0.6, off = (Math.random() - 0.5) * 0.5 * unit;
+        const speed = 0.1 + Math.random() * 0.08, side = (Math.random() - 0.5) * 0.15;
+        const m = 0.5 + Math.random() * 0.5;
+        const roll = Math.random();
+        const type = roll < 0.15 ? ELLIPTICAL : roll < 0.45 ? BARRED : SPIRAL;
+        gs.push({
+          c: wide ? [along, off] : [off, along], v: wide ? [-t * speed, side] : [side, -t * speed],
+          m, rd: (0.07 + Math.random() * 0.04) * unit * (0.6 + m * 0.6), spin: Math.random() < 0.5 ? -1 : 1, type,
+        });
+      }
+      if (Math.random() < 0.6) gs.push(satellite(gs[0], (0.3 + Math.random() * 0.2) * unit, Math.random() * 6.28, { m: 0.06, rd: 0.025 * unit, type: DWARF }));
+      return gs;
+    },
+  };
+
+  // A small companion on a roughly circular orbit around its host.
+  function satellite(host, dist, angle, g) {
+    const dir = [Math.cos(angle), Math.sin(angle)];
+    const v = Math.sqrt((G * host.m * 0.45) / dist) * (host.spin || 1);
+    return {
+      ...g, spin: g.spin || host.spin,
+      c: [host.c[0] + dir[0] * dist, host.c[1] + dir[1] * dist],
+      v: [host.v[0] - dir[1] * v, host.v[1] + dir[0] * v],
+    };
+  }
+
+  function galaxies(which) {
     const unit = Math.min(state.aspect, 1);
-    const gs = [];
-    let total = 0;
-    for (let k = 0; k < count; k++) {
-      const t = count === 2 ? (k ? 1 : -1) : k - 1;
-      const along = t * span * 0.6, off = (Math.random() - 0.5) * 0.5 * unit;
-      const c = wide ? [along, off] : [off, along];
-      const speed = 0.1 + Math.random() * 0.08;
-      const v = wide ? [-t * speed, (Math.random() - 0.5) * 0.15] : [(Math.random() - 0.5) * 0.15, -t * speed];
-      const m = 0.5 + Math.random() * 0.5;
-      total += m;
-      gs.push({ c, v, m, rd: (0.07 + Math.random() * 0.04) * unit * (0.6 + m * 0.6), spin: Math.random() < 0.5 ? -1 : 1 });
-    }
+    const gs = presets[which](unit, state.aspect >= 1, state.aspect).slice(0, GALAXIES);
+    const total = gs.reduce((t, g) => t + g.m, 0);
     let cum = 0;
     gs.forEach((g, k) => {
       cum += g.m / total;
-      uF.set([...g.c, ...g.v], O_GAL + k * 8);
-      uF.set([g.rd, k === count - 1 ? 1 : cum, g.spin, g.m / total], O_GAL + k * 8 + 4);
+      uF.set([...g.c, ...g.v], O_GAL + k * 12);
+      uF.set([g.rd, k === gs.length - 1 ? 1 : cum, g.spin, g.m / total], O_GAL + k * 12 + 4);
+      uF.set([g.type, g.phase ?? Math.random() * 6.28, 0, 0], O_GAL + k * 12 + 8);
     });
-    uU[7] = count;
+    uU[7] = gs.length;
   }
 
-  function reseed() {
+  function reseed(which = "random") {
     writeU();
-    galaxies();
+    galaxies(which);
     uU[3] = cap;
     uU[4] = (Math.random() * 2 ** 32) >>> 0;
     device.queue.writeBuffer(uBuf, 0, uData);
@@ -678,6 +751,7 @@ async function boot() {
       state.keys.add(e.key); e.preventDefault();
     } else if (e.key === " " || e.key === "Enter") { shock(...state.ptr); tutorial.done("tap"); e.preventDefault(); }
     else if (e.key === "r" || e.key === "R") { reseed(); tutorial.done("again"); }
+    else if (e.key === "l" || e.key === "L") reseed("local");
     else if (e.key === "p" || e.key === "P") time.toggle();
     else if (e.key === "," || e.key === "<") time.nudge(-1);
     else if (e.key === "." || e.key === ">") time.nudge(1);
@@ -692,7 +766,7 @@ async function boot() {
   $("again").onclick = () => { reseed(); tutorial.done("again"); };
   addEventListener("resize", resize);
   resize();
-  reseed();
+  reseed("local"); // first light: the Local Group; the again button deals random encounters
 
   // ---- frame loop ----
   // GPU frame time = submit to onSubmittedWorkDone with one frame in flight.
