@@ -439,6 +439,9 @@ async function boot() {
       state.keys.add(e.key); e.preventDefault();
     } else if (e.key === " " || e.key === "Enter") { shock(...state.ptr); tutorial.done("tap"); e.preventDefault(); }
     else if (e.key === "r" || e.key === "R") { reseed(); tutorial.done("again"); }
+    else if (e.key === "p" || e.key === "P") time.toggle();
+    else if (e.key === "," || e.key === "<") time.nudge(-1);
+    else if (e.key === "." || e.key === ">") time.nudge(1);
   });
   addEventListener("keyup", (e) => {
     if (!ARROWS[e.key]) return;
@@ -462,10 +465,12 @@ async function boot() {
 
     const dt = Math.min(0.1, (now - prev) / 1000);
     prev = now;
-    acc += dt;
+    acc += dt * time.rate();
+    // Faster time means more fixed steps, not bigger ones, so orbits stay stable.
+    const maxSteps = Math.max(MAX_SUBSTEPS, Math.ceil(MAX_SUBSTEPS * time.rate()));
     let steps = 0;
-    while (acc >= DT && steps < MAX_SUBSTEPS) { acc -= DT; steps++; }
-    if (steps === MAX_SUBSTEPS) acc = 0; // drop backlog rather than spiral
+    while (acc >= DT && steps < maxSteps) { acc -= DT; steps++; }
+    if (steps === maxSteps) acc = 0; // drop backlog rather than spiral
 
     if (state.keys.size) {
       let kx = 0, ky = 0;
@@ -550,19 +555,40 @@ async function boot() {
   }
   requestAnimationFrame(frame);
 
-  if (!store.get("pp.tut3")) tutorial.start();
+  if (!store.get("pp.tut4")) tutorial.start();
 }
 
 function fmt(n) {
   return n >= 1e6 ? (n / 1e6).toFixed(1) + "M" : Math.round(n / 1e3) + "K";
 }
 
-// ---- wordless tutorial: hold, tap, then a new encounter. One word per step. ----
+// ---- time: log-scale rate slider (1/8x to 4x) and a pause toggle ----
+const time = (() => {
+  const slider = $("rate"), pause = $("pause");
+  let paused = false;
+  const sync = () => {
+    pause.setAttribute("aria-pressed", String(paused));
+    const r = 2 ** Number(slider.value);
+    slider.setAttribute("aria-valuetext", r >= 1 ? `${r}x` : `1/${Math.round(1 / r)}x`);
+  };
+  slider.addEventListener("input", () => { paused = false; sync(); tutorial.done("time"); });
+  pause.onclick = () => api.toggle();
+  const api = {
+    rate: () => (paused ? 0 : 2 ** Number(slider.value)),
+    toggle() { paused = !paused; sync(); tutorial.done("time"); },
+    nudge(d) { slider.value = String(Number(slider.value) + d); paused = false; sync(); tutorial.done("time"); },
+  };
+  sync();
+  return api;
+})();
+
+// ---- wordless tutorial: hold, tap, time, then a new encounter. One word per step. ----
 const tutorial = (() => {
   const el = $("tut"), word = $("word"), learn = $("learn");
   const steps = [
     { id: "hold", word: "Hold" },
     { id: "tap", word: "Tap" },
+    { id: "time", word: "Time" },
     { id: "again", word: "Again" },
   ];
   let i = -1;
@@ -573,11 +599,13 @@ const tutorial = (() => {
     el.dataset.step = s.id;
     word.textContent = s.word;
     $("again").classList.toggle("beckon", s.id === "again");
+    $("clock").classList.toggle("beckon", s.id === "time");
   }
   function end() {
     el.hidden = true; learn.hidden = false; i = -1;
     $("again").classList.remove("beckon");
-    store.set("pp.tut3", "1");
+    $("clock").classList.remove("beckon");
+    store.set("pp.tut4", "1");
   }
   $("skip").onclick = end;
 

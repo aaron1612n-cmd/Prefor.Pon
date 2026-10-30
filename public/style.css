@@ -66,6 +66,50 @@ canvas {
 .again.beckon { color: var(--sodium); animation: beckon 1s ease-in-out infinite; }
 @keyframes beckon { 50% { transform: scale(1.35); } }
 
+/* Time: a pause glyph and a hairline slider, centred on the bottom edge. */
+.clock {
+  position: fixed;
+  left: 50%;
+  bottom: calc(var(--bottom) - 14px);
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--dim);
+}
+.clock:hover, .clock:focus-within { color: var(--bone); }
+.clock button {
+  width: 44px; height: 44px;
+  display: grid; place-items: center;
+  border: 0; padding: 0; background: none; color: inherit; cursor: pointer;
+}
+.clock button:focus-visible { outline: none; color: var(--sodium); }
+.clock svg { width: 11px; height: 11px; }
+.clock .bars { stroke: currentColor; stroke-width: 1.6; fill: none; }
+.clock .play { fill: var(--sodium); display: none; }
+#pause[aria-pressed="true"] .bars { display: none; }
+#pause[aria-pressed="true"] .play { display: block; }
+#rate {
+  -webkit-appearance: none; appearance: none;
+  width: clamp(96px, 18vw, 180px);
+  height: 44px;
+  margin: 0;
+  background: transparent;
+  cursor: pointer;
+}
+#rate:focus-visible { outline: none; }
+#rate::-webkit-slider-runnable-track { height: 1px; background: currentColor; }
+#rate::-moz-range-track { height: 1px; background: currentColor; }
+#rate::-webkit-slider-thumb {
+  -webkit-appearance: none; appearance: none;
+  width: 10px; height: 10px; margin-top: -4.5px;
+  border-radius: 50%; border: 0; background: var(--sodium);
+}
+#rate::-moz-range-thumb { width: 10px; height: 10px; border-radius: 50%; border: 0; background: var(--sodium); }
+#rate:focus-visible::-webkit-slider-thumb { box-shadow: 0 0 0 3px var(--ink), 0 0 0 4px var(--sodium); }
+.clock.beckon { color: var(--sodium); animation: beckon-x 1s ease-in-out infinite; }
+@keyframes beckon-x { 50% { transform: translateX(-50%) scale(1.15); } }
+
 /* ---- wordless tutorial ---- */
 .tut { position: fixed; inset: 0; pointer-events: none; }
 .tut[hidden] { display: none; }
@@ -90,7 +134,8 @@ canvas {
 }
 .tut[data-step="hold"] .finger { animation: hold 1.6s ease-in-out infinite; }
 .tut[data-step="tap"] .finger { animation: tap 0.9s ease-out infinite; }
-.tut[data-step="again"] .finger { display: none; }
+.tut[data-step="again"] .finger,
+.tut[data-step="time"] .finger { display: none; }
 @keyframes hold {
   0% { transform: scale(1.5); opacity: 0; }
   20% { transform: scale(1); opacity: 1; }
@@ -127,5 +172,5 @@ canvas {
 .nogpu span { color: var(--sodium); font-style: normal; }
 
 @media (prefers-reduced-motion: reduce) {
-  .tut .finger, .again.beckon { animation: none !important; }
+  .tut .finger, .again.beckon, .clock.beckon { animation: none !important; }
 }

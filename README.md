@@ -23,6 +23,8 @@ A WebGPU galaxy simulation: colliding spiral galaxies under self-gravity, runnin
 | Tap / Space | Supernova: a shock ring blows stars outward |
 | ↻ / R | A new random encounter of two or three galaxies |
 | Arrow keys | Move the black hole with the keyboard |
+| Pause glyph / P | Pause and resume time |
+| Slider / , . | Time rate, from 1/8x to 4x (starts at 1/2x) |
 
 ## Run
 

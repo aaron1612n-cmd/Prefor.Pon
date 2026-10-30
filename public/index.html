@@ -14,6 +14,12 @@
 <canvas id="gl" tabindex="0" aria-label="Particle field"></canvas>
 
 <p class="n" id="n" aria-live="off"></p>
+<div class="clock" id="clock">
+  <button id="pause" aria-label="Pause" aria-pressed="false">
+    <svg viewBox="0 0 12 12" aria-hidden="true"><path class="bars" d="M3.5 2v8M8.5 2v8"/><path class="play" d="M3 1.5v9l7.5-4.5z"/></svg>
+  </button>
+  <input id="rate" type="range" min="-3" max="2" step="1" value="-1" aria-label="Time rate">
+</div>
 <button class="again" id="again" aria-label="New galaxies">↻</button>
 <button class="learn" id="learn" aria-label="Replay tutorial">?</button>
 
