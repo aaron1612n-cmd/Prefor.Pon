@@ -46,7 +46,7 @@ canvas {
   pointer-events: none;
 }
 
-.learn, .skip {
+.learn, .skip, .again {
   position: fixed;
   right: var(--pad);
   bottom: calc(var(--bottom) - 14px);
@@ -60,7 +60,11 @@ canvas {
   text-align: right;
   cursor: pointer;
 }
-.learn:hover, .skip:hover, .learn:focus-visible, .skip:focus-visible { color: var(--bone); outline: none; }
+.again { right: calc(var(--pad) + 40px); font-size: 15px; }
+.learn:hover, .skip:hover, .again:hover,
+.learn:focus-visible, .skip:focus-visible, .again:focus-visible { color: var(--bone); outline: none; }
+.again.beckon { color: var(--sodium); animation: beckon 1s ease-in-out infinite; }
+@keyframes beckon { 50% { transform: scale(1.35); } }
 
 /* ---- wordless tutorial ---- */
 .tut { position: fixed; inset: 0; pointer-events: none; }
@@ -86,6 +90,7 @@ canvas {
 }
 .tut[data-step="hold"] .finger { animation: hold 1.6s ease-in-out infinite; }
 .tut[data-step="tap"] .finger { animation: tap 0.9s ease-out infinite; }
+.tut[data-step="again"] .finger { display: none; }
 @keyframes hold {
   0% { transform: scale(1.5); opacity: 0; }
   20% { transform: scale(1); opacity: 1; }
@@ -122,5 +127,5 @@ canvas {
 .nogpu span { color: var(--sodium); font-style: normal; }
 
 @media (prefers-reduced-motion: reduce) {
-  .tut .finger { animation: none !important; }
+  .tut .finger, .again.beckon { animation: none !important; }
 }

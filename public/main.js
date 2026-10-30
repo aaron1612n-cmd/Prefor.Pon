@@ -1,4 +1,4 @@
-// Prefor.Pon — GPU-resident particle field.
+// Prefor.Pon — GPU galaxy simulation: particle-mesh self-gravity, millions of stars.
 // Particles never leave the GPU: compute shader integrates, render pass reads the same buffers.
 
 const coarse = matchMedia("(pointer: coarse)").matches;
@@ -9,21 +9,28 @@ const DT = 1 / 60; // fixed physics step
 const MAX_SUBSTEPS = 2; // more substeps on a slow frame only makes the next frame slower
 const WG = 256;
 const SHOCKS = 4;
-const TRAIL = 0.86; // fraction of last frame kept
+const GALAXIES = 3;
+const TRAIL = 0.7; // fraction of last frame kept
+const GRID = coarse ? 40 : 56; // gravity grid rows; columns follow the aspect ratio
+const G = 0.22;
 
 const U_WGSL = /* wgsl */ `
 struct U {
   dt: f32, time: f32, aspect: f32, count: u32,
-  seed: u32, _a: u32, _b: u32, _c: u32,
-  wells: array<vec4f, 3>,   // xy pos, z pull, w swirl
+  seed: u32, gx: u32, gy: u32, ngal: u32,
+  well: vec4f,                     // xy pos, z = G*M of the black hole under the finger
   shocks: array<vec4f, ${SHOCKS}>, // xy origin, z age, w strength
+  gal: array<vec4f, ${GALAXIES * 2}>, // per galaxy: (cx, cy, vx, vy), (scale, cumulative share, spin, mass)
+  grav: vec4f,                     // G, softening^2, cell w, cell h
 };
 `;
 
 const SIM_WGSL = U_WGSL + /* wgsl */ `
 @group(0) @binding(0) var<uniform> u: U;
 @group(0) @binding(1) var<storage, read_write> pos: array<vec2f>;
-@group(0) @binding(2) var<storage, read_write> vel: array<u32>; // f16x2
+@group(0) @binding(2) var<storage, read_write> vel: array<vec2f>;
+@group(0) @binding(3) var<storage, read_write> mass: array<atomic<u32>>;
+@group(0) @binding(4) var<storage, read_write> field: array<vec2f>;
 
 fn pcg(v: u32) -> u32 {
   let s = v * 747796405u + 2891336453u;
@@ -32,30 +39,95 @@ fn pcg(v: u32) -> u32 {
 }
 fn rnd(h: ptr<function, u32>) -> f32 {
   *h = pcg(*h);
-  return f32(*h) * (1.0 / 4294967296.0);
+  return (f32(*h >> 8u) + 0.5) * (1.0 / 16777216.0);
 }
 
+// Spiral discs on circular orbits. The galaxy is picked by hash, not by index,
+// so any prefix [0, count) is a fair sample and the adaptive count never skews the mass.
 @compute @workgroup_size(${WG})
 fn seed(@builtin(global_invocation_id) id: vec3u) {
   let i = id.x;
   if (i >= u.count) { return; }
   var h = pcg(i ^ u.seed);
+  let pick = rnd(&h);
+  var k = 0u;
+  for (var j = 0u; j < u.ngal - 1u; j++) { if (pick > u.gal[j * 2u + 1u].y) { k = j + 1u; } }
+  let g0 = u.gal[k * 2u];
+  let g1 = u.gal[k * 2u + 1u];
+  let rd = g1.x;
   let a = rnd(&h) * 6.2831853;
-  let r = sqrt(rnd(&h)) * 0.015;
+  var r: f32;
+  if (rnd(&h) < 0.18) {
+    r = rd * 0.35 * sqrt(-2.0 * log(rnd(&h))); // bulge
+  } else {
+    r = min(-rd * log(rnd(&h) * rnd(&h)), rd * 5.0); // exponential disc
+  }
   let d = vec2f(cos(a), sin(a));
-  let s = 0.25 + pow(rnd(&h), 1.6) * 1.9;
-  pos[i] = d * r;
-  vel[i] = pack2x16float(d * s + vec2f(-d.y, d.x) * s * 0.35);
+  let x = r / rd;
+  let enclosed = g1.w * (1.0 - (1.0 + x) * exp(-x));
+  let vc = sqrt(u.grav.x * enclosed / sqrt(r * r + u.grav.y));
+  let jitter = vec2f(rnd(&h) - 0.5, rnd(&h) - 0.5) * vc * 0.12;
+  pos[i] = g0.xy + d * r;
+  vel[i] = g0.zw + vec2f(-d.y, d.x) * vc * g1.z + jitter;
 }
 
-// Divergence-free flow: curl of a drifting stream function, so particles swirl instead of clumping.
-fn flow(p: vec2f, t: f32) -> vec2f {
-  let A = 1.7 * p.x + 0.37 * t;
-  let B = 2.3 * p.y - 0.29 * t;
-  let C = 3.1 * p.x + 3.7 * p.y - 0.41 * t;
-  let dx = 1.7 * cos(A) * cos(B) + 1.55 * cos(C);
-  let dy = -2.3 * sin(A) * sin(B) + 1.85 * cos(C);
-  return vec2f(dy, -dx);
+fn cellOf(p: vec2f) -> u32 {
+  let c = vec2i(floor((p + vec2f(u.aspect, 1.0)) / u.grav.zw));
+  let cx = u32(clamp(c.x, 0, i32(u.gx) - 1));
+  let cy = u32(clamp(c.y, 0, i32(u.gy) - 1));
+  return cy * u.gx + cx;
+}
+
+@compute @workgroup_size(${WG})
+fn clear(@builtin(global_invocation_id) id: vec3u) {
+  if (id.x < u.gx * u.gy) { atomicStore(&mass[id.x], 0u); }
+}
+
+@compute @workgroup_size(${WG})
+fn deposit(@builtin(global_invocation_id) id: vec3u) {
+  if (id.x >= u.count) { return; }
+  atomicAdd(&mass[cellOf(pos[id.x])], 1u);
+}
+
+// Gravity on the grid: every cell sums every other cell, tiled through workgroup memory.
+// Cost is cells^2, fixed no matter how many particles there are.
+const FT = 64u;
+var<workgroup> tile: array<vec3f, FT>;
+
+fn centre(c: u32) -> vec2f {
+  return (vec2f(f32(c % u.gx), f32(c / u.gx)) + 0.5) * u.grav.zw - vec2f(u.aspect, 1.0);
+}
+
+@compute @workgroup_size(FT)
+fn gravity(@builtin(global_invocation_id) id: vec3u, @builtin(local_invocation_index) li: u32) {
+  let cells = u.gx * u.gy;
+  let me = centre(min(id.x, cells - 1u));
+  var acc = vec2f(0.0);
+  for (var t = 0u; t < cells; t += FT) {
+    let j = t + li;
+    tile[li] = select(vec3f(0.0), vec3f(centre(j), f32(atomicLoad(&mass[j]))), j < cells);
+    workgroupBarrier();
+    for (var k = 0u; k < FT; k++) {
+      let c = tile[k];
+      let d = c.xy - me;
+      let ir = inverseSqrt(dot(d, d) + u.grav.y);
+      acc += d * (c.z * ir * ir * ir);
+    }
+    workgroupBarrier();
+  }
+  if (id.x < cells) { field[id.x] = acc * (u.grav.x / f32(u.count)); }
+}
+
+fn sampleField(p: vec2f) -> vec2f {
+  let g = (p + vec2f(u.aspect, 1.0)) / u.grav.zw - 0.5;
+  let hi = vec2f(f32(u.gx) - 1.0, f32(u.gy) - 1.0);
+  let gc = clamp(g, vec2f(0.0), hi);
+  let i0 = vec2u(floor(gc));
+  let i1 = min(i0 + 1u, vec2u(hi));
+  let f = gc - vec2f(i0);
+  let a = mix(field[i0.y * u.gx + i0.x], field[i0.y * u.gx + i1.x], f.x);
+  let b = mix(field[i1.y * u.gx + i0.x], field[i1.y * u.gx + i1.x], f.x);
+  return mix(a, b, f.y);
 }
 
 @compute @workgroup_size(${WG})
@@ -63,40 +135,35 @@ fn step(@builtin(global_invocation_id) id: vec3u) {
   let i = id.x;
   if (i >= u.count) { return; }
   var p = pos[i];
-  var v = unpack2x16float(vel[i]);
+  var v = vel[i];
 
-  // Relax toward the flow field.
-  var a = (flow(p, u.time) * 0.28 - v) * 0.9;
+  var a = sampleField(p);
 
-  // Wells: softened inverse-square pull plus a tangential swirl, so things orbit rather than collapse.
-  for (var k = 0u; k < 3u; k++) {
-    let w = u.wells[k];
-    if (w.z == 0.0 && w.w == 0.0) { continue; }
-    let d = w.xy - p;
-    let r2 = dot(d, d) + 0.004;
-    a += (d * w.z + vec2f(-d.y, d.x) * w.w) * (inverseSqrt(r2) / r2);
+  // Black hole under the finger.
+  if (u.well.z > 0.0) {
+    let d = u.well.xy - p;
+    let ir = inverseSqrt(dot(d, d) + 0.0008);
+    a += d * (u.well.z * ir * ir * ir);
   }
 
-  // Shock rings: an expanding front that kicks particles outward as it passes.
+  // Supernova: an expanding front that kicks stars outward as it passes.
   for (var k = 0u; k < ${SHOCKS}u; k++) {
     let s = u.shocks[k];
     if (s.w == 0.0) { continue; }
     let d = p - s.xy;
     let r = length(d) + 1e-4;
-    let x = (r - s.z * 1.3) / 0.05;
-    a += d / r * (s.w * exp(-x * x) * exp(-s.z * 1.4));
+    let x = (r - s.z * 0.9) / 0.04;
+    a += d / r * (s.w * exp(-x * x) * exp(-s.z * 2.0));
   }
 
-  v += a * u.dt;
-  p += v * u.dt;
-
-  // Wrap instead of clamping: clamped walls pile particles onto the same edge pixels,
-  // and that blend contention is what made long runs slow down.
+  // Soft leash past the screen edge, so escaping stars come home instead of vanishing.
   let lim = vec2f(u.aspect, 1.0);
-  p = select(p, p - sign(p) * lim * 2.0, abs(p) > lim);
+  a -= sign(p) * max(abs(p) - lim, vec2f(0.0)) * 3.0;
 
+  v += a * u.dt; // kick-drift: symplectic, keeps orbits from spiralling in or out
+  p += v * u.dt;
   pos[i] = p;
-  vel[i] = pack2x16float(v);
+  vel[i] = v;
 }
 `;
 
@@ -104,14 +171,14 @@ const DRAW_WGSL = U_WGSL + /* wgsl */ `
 struct R { gain: f32, exposure: f32, _p: vec2f };
 @group(0) @binding(0) var<uniform> u: U;
 @group(0) @binding(1) var<storage, read> pos: array<vec2f>;
-@group(0) @binding(2) var<storage, read> vel: array<u32>;
+@group(0) @binding(2) var<storage, read> vel: array<vec2f>;
 @group(0) @binding(3) var<uniform> r: R;
 
 struct VO { @builtin(position) p: vec4f, @location(0) c: vec3f };
 
 @vertex fn vs(@builtin(vertex_index) i: u32) -> VO {
   let p = pos[i];
-  let s = length(unpack2x16float(vel[i]));
+  let s = length(vel[i]);
   let bone = vec3f(0.91, 0.86, 0.76);
   let sodium = vec3f(1.0, 0.36, 0.06);
   var o: VO;
@@ -158,7 +225,7 @@ const store = {
 async function boot() {
   const adapter = navigator.gpu && (await navigator.gpu.requestAdapter({ powerPreference: "high-performance" }));
   if (!adapter) { $("nogpu").hidden = false; return; }
-  const want = CAP * 8;
+  const want = Math.max(CAP * 8, GRID * GRID * 4 * 8);
   const device = await adapter.requestDevice({
     requiredFeatures: ["rg11b10ufloat-renderable", "timestamp-query"].filter((f) => adapter.features.has(f)),
     requiredLimits: {
@@ -179,8 +246,13 @@ async function boot() {
   const fadeMod = device.createShaderModule({ code: FADE_WGSL });
   const toneMod = device.createShaderModule({ code: TONE_WGSL });
 
-  const seedPipe = device.createComputePipeline({ layout: "auto", compute: { module: simMod, entryPoint: "seed" } });
-  const stepPipe = device.createComputePipeline({ layout: "auto", compute: { module: simMod, entryPoint: "step" } });
+  const storage = (i) => ({ binding: i, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } });
+  const simLayout = device.createBindGroupLayout({
+    entries: [{ binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: "uniform" } }, storage(1), storage(2), storage(3), storage(4)],
+  });
+  const simPL = device.createPipelineLayout({ bindGroupLayouts: [simLayout] });
+  const cp = (entryPoint) => device.createComputePipeline({ layout: simPL, compute: { module: simMod, entryPoint } });
+  const seedPipe = cp("seed"), clearPipe = cp("clear"), depositPipe = cp("deposit"), gravityPipe = cp("gravity"), stepPipe = cp("step");
   const blend = (srcFactor, dstFactor) => ({ color: { srcFactor, dstFactor, operation: "add" }, alpha: { srcFactor, dstFactor, operation: "add" } });
   const drawPipe = device.createRenderPipeline({
     layout: "auto",
@@ -205,7 +277,8 @@ async function boot() {
   const qResolve = timed && device.createBuffer({ size: 16, usage: GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC });
   const qRead = timed && device.createBuffer({ size: 16, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
 
-  const U_SIZE = 32 + 16 * 3 + 16 * SHOCKS;
+  const U_SIZE = 32 + 16 + 16 * SHOCKS + 32 * GALAXIES + 16;
+  const O_WELL = 8, O_SHOCK = 12, O_GAL = O_SHOCK + 4 * SHOCKS, O_GRAV = O_GAL + 8 * GALAXIES;
   const uBuf = device.createBuffer({ size: U_SIZE, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
   const rBuf = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
   const uData = new ArrayBuffer(U_SIZE);
@@ -227,23 +300,56 @@ async function boot() {
 
   const usage = GPUBufferUsage.STORAGE;
   const pos = device.createBuffer({ size: cap * 8, usage });
-  const vel = device.createBuffer({ size: cap * 4, usage });
-  const bg = (pipe, extra = []) => device.createBindGroup({
-    layout: pipe.getBindGroupLayout(0),
-    entries: [{ binding: 0, resource: { buffer: uBuf } }, { binding: 1, resource: { buffer: pos } }, { binding: 2, resource: { buffer: vel } }, ...extra],
+  const vel = device.createBuffer({ size: cap * 8, usage }); // f32: tiny orbital kicks vanish in f16
+  const maxCells = GRID * GRID * 4; // up to 4:1 aspect
+  const massBuf = device.createBuffer({ size: maxCells * 4, usage });
+  const fieldBuf = device.createBuffer({ size: maxCells * 8, usage });
+  const base = [{ binding: 0, resource: { buffer: uBuf } }, { binding: 1, resource: { buffer: pos } }, { binding: 2, resource: { buffer: vel } }];
+  const simBG = device.createBindGroup({
+    layout: simLayout,
+    entries: [...base, { binding: 3, resource: { buffer: massBuf } }, { binding: 4, resource: { buffer: fieldBuf } }],
   });
-  const seedBG = bg(seedPipe), stepBG = bg(stepPipe), drawBG = bg(drawPipe, [{ binding: 3, resource: { buffer: rBuf } }]);
+  const drawBG = device.createBindGroup({ layout: drawPipe.getBindGroupLayout(0), entries: [...base, { binding: 3, resource: { buffer: rBuf } }] });
+  let gx = GRID;
   let hdr, toneBG;
+
+  // A random encounter: two or three discs on a slow, slightly offset collision course.
+  function galaxies() {
+    const count = Math.random() < 0.35 ? 3 : 2;
+    const wide = state.aspect >= 1;
+    const span = wide ? Math.min(state.aspect, 1.6) : 1;
+    const unit = Math.min(state.aspect, 1);
+    const gs = [];
+    let total = 0;
+    for (let k = 0; k < count; k++) {
+      const t = count === 2 ? (k ? 1 : -1) : k - 1;
+      const along = t * span * 0.5, off = (Math.random() - 0.5) * 0.5 * unit;
+      const c = wide ? [along, off] : [off, along];
+      const speed = 0.1 + Math.random() * 0.08;
+      const v = wide ? [-t * speed, (Math.random() - 0.5) * 0.15] : [(Math.random() - 0.5) * 0.15, -t * speed];
+      const m = 0.5 + Math.random() * 0.5;
+      total += m;
+      gs.push({ c, v, m, rd: (0.06 + Math.random() * 0.04) * unit * (0.6 + m * 0.6), spin: Math.random() < 0.5 ? -1 : 1 });
+    }
+    let cum = 0;
+    gs.forEach((g, k) => {
+      cum += g.m / total;
+      uF.set([...g.c, ...g.v], O_GAL + k * 8);
+      uF.set([g.rd, k === count - 1 ? 1 : cum, g.spin, g.m / total], O_GAL + k * 8 + 4);
+    });
+    uU[7] = count;
+  }
 
   function reseed() {
     writeU();
+    galaxies();
     uU[3] = cap;
     uU[4] = (Math.random() * 2 ** 32) >>> 0;
     device.queue.writeBuffer(uBuf, 0, uData);
     const enc = device.createCommandEncoder();
     const pass = enc.beginComputePass();
     pass.setPipeline(seedPipe);
-    pass.setBindGroup(0, seedBG);
+    pass.setBindGroup(0, simBG);
     pass.dispatchWorkgroups(Math.ceil(cap / WG));
     pass.end();
     device.queue.submit([enc.finish()]);
@@ -266,6 +372,7 @@ async function boot() {
     if (canvas.width === w && canvas.height === h && hdr) return;
     canvas.width = w; canvas.height = h;
     state.aspect = w / h;
+    gx = Math.max(8, Math.min(GRID * 4, Math.round(GRID * state.aspect)));
     hdr?.destroy();
     hdr = device.createTexture({ size: [w, h], format: HDR, usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING });
     toneBG = device.createBindGroup({
@@ -277,26 +384,22 @@ async function boot() {
 
   function writeU(now = performance.now()) {
     uF[0] = DT; uF[1] = state.time; uF[2] = state.aspect; uU[3] = state.n;
-    const t = state.time;
-    // Pointer well ramps in over a hold, so a tap is a shock and not a tug.
-    const held = state.down || state.keys.size ? Math.min(1, (now - state.downAt) / 400) : 0;
-    const wells = [
-      [state.ptr[0], state.ptr[1], 0.32 * held, 0.22 * held],
-      // Two slow wandering vortices keep the field alive with no input.
-      [Math.sin(t * 0.13) * state.aspect * 0.55, Math.sin(t * 0.21 + 1) * 0.5, 0.012, 0.05],
-      [Math.cos(t * 0.17 + 2) * state.aspect * 0.5, Math.cos(t * 0.11) * 0.55, 0.012, -0.05],
-    ];
-    wells.forEach((w, k) => uF.set(w, 8 + k * 4));
-    state.shocks = state.shocks.filter((s) => now - s.born < 2500);
+    uU[5] = gx; uU[6] = GRID;
+    const cw = (2 * state.aspect) / gx, ch = 2 / GRID;
+    uF.set([G, (1.2 * ch) ** 2, cw, ch], O_GRAV);
+    // The black hole grows over a hold, so a tap is a supernova and not a tug.
+    const held = state.down || state.keys.size ? Math.min(1, (now - state.downAt) / 600) : 0;
+    uF.set([state.ptr[0], state.ptr[1], 0.12 * held, 0], O_WELL);
+    state.shocks = state.shocks.filter((s) => now - s.born < 2000);
     for (let k = 0; k < SHOCKS; k++) {
       const s = state.shocks[k];
-      uF.set(s ? [s.x, s.y, (now - s.born) / 1000, s.s] : [0, 0, 0, 0], 20 + k * 4);
+      uF.set(s ? [s.x, s.y, (now - s.born) / 1000, s.s] : [0, 0, 0, 0], O_SHOCK + k * 4);
     }
   }
 
   function shock(x, y) {
     if (state.shocks.length >= SHOCKS) state.shocks.shift();
-    state.shocks.push({ x, y, born: performance.now(), s: 9 });
+    state.shocks.push({ x, y, born: performance.now(), s: 14 });
   }
 
   // ---- input ----
@@ -335,7 +438,7 @@ async function boot() {
       if (!state.keys.size) state.downAt = performance.now();
       state.keys.add(e.key); e.preventDefault();
     } else if (e.key === " " || e.key === "Enter") { shock(...state.ptr); tutorial.done("tap"); e.preventDefault(); }
-    else if (e.key === "r" || e.key === "R") reseed();
+    else if (e.key === "r" || e.key === "R") { reseed(); tutorial.done("again"); }
   });
   addEventListener("keyup", (e) => {
     if (!ARROWS[e.key]) return;
@@ -344,6 +447,7 @@ async function boot() {
   });
 
   $("learn").onclick = () => tutorial.start();
+  $("again").onclick = () => { reseed(); tutorial.done("again"); };
   addEventListener("resize", resize);
   resize();
   reseed();
@@ -379,10 +483,14 @@ async function boot() {
     const enc = device.createCommandEncoder();
     if (steps) {
       const pass = enc.beginComputePass(timed ? { timestampWrites: { querySet: qs, beginningOfPassWriteIndex: 0 } } : {});
-      pass.setPipeline(stepPipe);
-      pass.setBindGroup(0, stepBG);
-      const groups = Math.ceil(state.n / WG);
-      for (let s = 0; s < steps; s++) pass.dispatchWorkgroups(groups);
+      pass.setBindGroup(0, simBG);
+      const groups = Math.ceil(state.n / WG), cells = gx * GRID;
+      for (let s = 0; s < steps; s++) {
+        pass.setPipeline(clearPipe); pass.dispatchWorkgroups(Math.ceil(cells / WG));
+        pass.setPipeline(depositPipe); pass.dispatchWorkgroups(groups);
+        pass.setPipeline(gravityPipe); pass.dispatchWorkgroups(Math.ceil(cells / 64));
+        pass.setPipeline(stepPipe); pass.dispatchWorkgroups(groups);
+      }
       pass.end();
     }
 
@@ -442,19 +550,20 @@ async function boot() {
   }
   requestAnimationFrame(frame);
 
-  if (!store.get("pp.tut2")) tutorial.start();
+  if (!store.get("pp.tut3")) tutorial.start();
 }
 
 function fmt(n) {
   return n >= 1e6 ? (n / 1e6).toFixed(1) + "M" : Math.round(n / 1e3) + "K";
 }
 
-// ---- wordless tutorial: hold, then tap. One word per step. ----
+// ---- wordless tutorial: hold, tap, then a new encounter. One word per step. ----
 const tutorial = (() => {
   const el = $("tut"), word = $("word"), learn = $("learn");
   const steps = [
     { id: "hold", word: "Hold" },
     { id: "tap", word: "Tap" },
+    { id: "again", word: "Again" },
   ];
   let i = -1;
 
@@ -463,10 +572,12 @@ const tutorial = (() => {
     if (!s) return end();
     el.dataset.step = s.id;
     word.textContent = s.word;
+    $("again").classList.toggle("beckon", s.id === "again");
   }
   function end() {
     el.hidden = true; learn.hidden = false; i = -1;
-    store.set("pp.tut2", "1");
+    $("again").classList.remove("beckon");
+    store.set("pp.tut3", "1");
   }
   $("skip").onclick = end;
 
