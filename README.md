@@ -1,6 +1,6 @@
 # Prefor.Pon
 
-A WebGPU galaxy simulation: colliding spiral galaxies under self-gravity, running entirely on the GPU, rendered to look like a telescope image.
+A 3D WebGPU galaxy simulation: colliding galaxies under self-gravity, running entirely on the GPU, rendered to look like a telescope image. Orbit the camera to see discs face-on or edge-on, with the dust lane through the middle.
 
 ## Physics
 
@@ -9,7 +9,7 @@ A WebGPU galaxy simulation: colliding spiral galaxies under self-gravity, runnin
 - **Presets.** The first view is the Local Group: the Milky Way (barred) and Andromeda (about 1.5x heavier) on their head-on approach, with the LMC, Triangulum (M33) and M110. Positions are compressed to fit the screen, while sizes, mass ratios and types follow the real galaxies. ↻ deals random encounters, often with a satellite dwarf, and L brings the Local Group back.
 - **Disc rotation from the measured field.** After seeding, one gravity solve runs and every disc particle gets the circular speed that the grid force actually gives at its position. A mismatched start makes cold gas ring in concentric waves.
 - **Spiral density waves seeded:** a two-armed logarithmic spiral with a pitch of about 15°, strongest in gas and young stars.
-- **Star formation and feedback.** Gas above about 6x the mean local gas density turns into young stars, faster the denser it is. After about 70 Myr, a third of the young stars go supernova and return to gas with a kick, and the rest join the old population. Mergers trigger starbursts and use up the gas.
+- **Star formation and feedback.** Gas well above the typical disc density (spiral arms, bars, collision shocks) turns into young stars, faster the denser it is. After about 70 Myr, a third of the young stars go supernova and return to gas with a kick, and the rest join the old population. Mergers trigger starbursts and use up the gas.
 - **Central black holes.** Every galaxy has one, about 1% of its mass, which is heavier than real (about 0.1%) so the coarse grid can still sink it. When two holes come within a grid cell of each other they merge, conserving momentum, and the survivor flares as a quasar for about 100 Myr. Between mergers, each nucleus glows in proportion to the gas around it.
 - **Units:** 1 length unit is 25 kpc and 1 sim second is 150 Myr. The time control shows Myr per second, and the readout shows the elapsed time.
 
@@ -23,7 +23,8 @@ A WebGPU galaxy simulation: colliding spiral galaxies under self-gravity, runnin
 
 ## How it stays fast
 
-- **Particle-mesh gravity.** Stars are binned into a coarse grid (56 rows, columns follow the aspect ratio) with atomic adds. Each grid cell then sums the pull of every other cell, tiled through workgroup memory, and every star samples that force field bilinearly. That is O(cells²) instead of O(n²), so gravity costs the same at 16K stars as at 2M. There are four dispatches per step (clear, deposit, gravity, integrate), all in one compute pass.
+- **Particle-mesh gravity with an FFT Poisson solve.** Mass goes onto a 64³ grid (32³ on phones) with atomic adds, inside a zero-padded 128³ box so the convolution is isolated. Radix-2 FFTs run one line per workgroup in workgroup memory; the density spectrum is multiplied by the precomputed spectrum of a softened 1/r kernel, transformed back, and differentiated into a force grid that every star samples trilinearly. Lines that are all zero in the padded box are skipped. Cost is independent of the particle count.
+- **Thick and thin discs.** Cold gas sits in a layer about 1/25 of the disc scale length thick, young stars a little thicker and old stars about 1/7, as in the Milky Way. Every galaxy has its own tilt; Andromeda is seen nearly edge-on, as from Earth.
 - **Symplectic integration.** Kick-drift with f32 velocity keeps orbits stable. In f16, the small per-step kicks would round away.
 - **Prefix-safe seeding.** Each star picks its galaxy by hash rather than by index, so the adaptive count always simulates a fair sample with the same total mass.
 
@@ -38,11 +39,12 @@ A WebGPU galaxy simulation: colliding spiral galaxies under self-gravity, runnin
 
 | Input | Action |
 | --- | --- |
-| Hold (touch or mouse) | A black hole grows under your finger |
-| Tap / Space | Supernova: a shock ring blows stars outward |
+| Drag / arrow keys | Orbit the camera |
+| Pinch / scroll / + − | Zoom |
+| Hold still (touch or mouse) / Enter | A black hole grows under your finger |
+| Tap / Space | Supernova: a shock front blows stars outward |
 | ↻ / R | A new random encounter of two or three galaxies |
 | L | The Local Group preset |
-| Arrow keys | Move the black hole with the keyboard |
 | Pause glyph / P | Pause and resume time |
 | Slider / , . | Time rate, from 1/8x to 4x (starts at 1/2x) |
 
@@ -58,5 +60,5 @@ Or open `public/` with any static server. Requires a WebGPU browser (Chrome/Edge
 
 ## Next
 
-- Finer gravity on a GPU FFT grid, so galaxy cores get sharper.
+- Tree or P³M short-range correction, so galaxy cores get sharper than one grid cell.
 - WebGL2 transform-feedback fallback.

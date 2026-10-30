@@ -135,6 +135,8 @@ canvas {
 }
 .tut[data-step="hold"] .finger { animation: hold 1.6s ease-in-out infinite; }
 .tut[data-step="tap"] .finger { animation: tap 0.9s ease-out infinite; }
+.tut[data-step="drag"] .finger { animation: drag 1.8s ease-in-out infinite; }
+.tut[data-step="zoom"] .finger { animation: zoom 1.4s ease-in-out infinite alternate; }
 .tut[data-step="again"] .finger,
 .tut[data-step="time"] .finger { display: none; }
 @keyframes hold {
@@ -142,6 +144,16 @@ canvas {
   20% { transform: scale(1); opacity: 1; }
   80% { transform: scale(0.7); opacity: 1; }
   100% { transform: scale(0.7); opacity: 0; }
+}
+@keyframes drag {
+  0% { transform: translateX(-56px); opacity: 0; }
+  15% { opacity: 1; }
+  85% { opacity: 1; }
+  100% { transform: translateX(56px); opacity: 0; }
+}
+@keyframes zoom {
+  from { transform: scale(0.6); }
+  to { transform: scale(1.7); }
 }
 @keyframes tap {
   0% { transform: scale(0.6); opacity: 1; }
