@@ -1,23 +1,25 @@
 # Prefor.Pon
 
-A GPU-resident particle field built on WebGPU. Up to 8M particles, one compute dispatch per physics substep, one draw call.
+A GPU-resident particle field built on WebGPU. Up to 4M particles (1M on phones), one compute dispatch per physics substep, one draw call.
 
 ## How it stays fast
 
 - **Nothing round-trips to the CPU.** Positions and velocities live in two GPU storage buffers (struct-of-arrays). The compute shader writes them; the vertex shader reads the same buffers by `vertex_index`. No vertex buffers, no readbacks.
-- **Fixed timestep.** Physics runs at 120 Hz with up to 4 substeps per frame, all batched in a single compute pass. Backlog is dropped instead of spiralling.
-- **One draw call.** Particles render as `point-list` into an `rgba16float` target with additive blending, so density reads as brightness; a fullscreen tonemap pass maps it to the screen.
+- **Fixed timestep.** Physics runs at 60 Hz with at most 2 substeps per frame, batched in one compute pass. Backlog is dropped instead of spiralling.
+- **Small footprint.** Velocity is packed as two f16s (12 bytes per particle in total), and the HDR target is `rg11b10ufloat` (4 bytes per pixel) where the GPU supports rendering to it. It renders at CSS-pixel resolution because points are 1px anyway.
+- **No pile-ups.** The flow field is divergence-free and the edges wrap. Clamped walls used to stack particles on the same edge pixels, and that additive-blend contention slowed long runs down.
+- **Adaptive count.** The active count grows while the frame rate holds and backs off when it drops. Buffers are allocated once at capacity, so changing the count never resets the scene.
+- **One draw call.** Particles render as `point-list` with additive blending, so density reads as brightness. Trails come from fading the previous frame with a blend constant, with no ping-pong buffer, and a fullscreen tonemap pass maps the result to the screen.
 - **Constant brightness.** Per-particle gain scales with pixels / particle count, so 16K and 8M look equally exposed.
 
 ## Controls
 
 | Input | Action |
 | --- | --- |
-| Drag / touch | Pull particles toward the pointer |
-| Flip button / Space | Toggle attract ↔ repel |
-| + / − | Double / halve particle count |
+| Hold (touch or mouse) | A vortex grows under your finger and pulls the field in |
+| Tap / Space | Sends out a shockwave ring |
+| Arrow keys | Move the vortex with the keyboard |
 | R | Reset |
-| Arrow keys | Move the attractor with the keyboard |
 
 ## Run
 
