@@ -4,7 +4,9 @@
   "type": "module",
   "scripts": {
     "dev": "wrangler dev",
-    "deploy": "wrangler deploy"
+    "deploy": "wrangler deploy",
+    "build:inline": "node scripts/build-inline.mjs",
+    "deploy:inline": "npm run build:inline && wrangler deploy -c wrangler.inline.jsonc"
   },
   "devDependencies": {
     "wrangler": "^4.0.0"

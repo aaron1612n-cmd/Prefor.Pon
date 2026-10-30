@@ -1,0 +1,9 @@
+{
+  // Same Worker as wrangler.jsonc, but with public/ inlined into the script
+  // (npm run deploy:inline). Use when the assets upload returns 401.
+  "name": "prefor-pon",
+  "main": "dist/worker.js",
+  "compatibility_date": "2026-10-01",
+  "workers_dev": true,
+  "preview_urls": false
+}

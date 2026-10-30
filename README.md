@@ -25,6 +25,7 @@ A GPU-resident particle field built on WebGPU. Up to 8M particles, one compute d
 npm install
 npm run dev      # local, via wrangler
 npm run deploy   # Cloudflare Worker (needs CLOUDFLARE_API_TOKEN + CLOUDFLARE_ACCOUNT_ID)
+npm run deploy:inline   # same Worker with public/ inlined; use if the assets upload returns 401
 ```
 
 Or open `public/` with any static server. Requires a WebGPU browser (Chrome/Edge 113+, Safari 26+, Firefox 141+ on Windows).
