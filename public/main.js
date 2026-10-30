@@ -2,8 +2,9 @@
 // Particles never leave the GPU: compute shader integrates, render pass reads the same buffers.
 
 const coarse = matchMedia("(pointer: coarse)").matches;
-const CAP = coarse ? 1 << 20 : 1 << 22; // buffer capacity; active count adapts below it
-const MIN_N = 1 << 15;
+const CAP = coarse ? 1 << 19 : 1 << 21; // buffer capacity; active count adapts below it
+const BUDGET = coarse ? 9 : 7; // ms of GPU time per frame we allow ourselves
+const MIN_N = 1 << 14;
 const DT = 1 / 60; // fixed physics step
 const MAX_SUBSTEPS = 2; // more substeps on a slow frame only makes the next frame slower
 const WG = 256;
@@ -159,7 +160,7 @@ async function boot() {
   if (!adapter) { $("nogpu").hidden = false; return; }
   const want = CAP * 8;
   const device = await adapter.requestDevice({
-    requiredFeatures: adapter.features.has("rg11b10ufloat-renderable") ? ["rg11b10ufloat-renderable"] : [],
+    requiredFeatures: ["rg11b10ufloat-renderable", "timestamp-query"].filter((f) => adapter.features.has(f)),
     requiredLimits: {
       maxStorageBufferBindingSize: Math.min(adapter.limits.maxStorageBufferBindingSize, want),
       maxBufferSize: Math.min(adapter.limits.maxBufferSize, want),
@@ -198,6 +199,12 @@ async function boot() {
     fragment: { module: toneMod, entryPoint: "fs", targets: [{ format }] },
   });
 
+  // Real GPU time via timestamp queries where supported; otherwise submit-to-done wall time.
+  const timed = device.features.has("timestamp-query");
+  const qs = timed && device.createQuerySet({ type: "timestamp", count: 2 });
+  const qResolve = timed && device.createBuffer({ size: 16, usage: GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC });
+  const qRead = timed && device.createBuffer({ size: 16, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+
   const U_SIZE = 32 + 16 * 3 + 16 * SHOCKS;
   const uBuf = device.createBuffer({ size: U_SIZE, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
   const rBuf = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
@@ -206,7 +213,8 @@ async function boot() {
   const uU = new Uint32Array(uData);
 
   const state = {
-    n: Math.min(cap, coarse ? 1 << 17 : 1 << 19), // start light, grow to fit the GPU
+    n: Math.min(cap, coarse ? 1 << 15 : 1 << 16), // start light, grow only while the GPU has headroom
+    scale: 1, // internal render resolution, dropped only if the minimum count still misses budget
     time: 0,
     aspect: 1,
     ptr: [0, 0],
@@ -251,8 +259,8 @@ async function boot() {
   }
 
   function resize() {
-    // Points are 1px whatever the density, so render at CSS resolution: on a 2x screen that is a quarter of the fill.
-    const dpr = 1;
+    // Points are 1px whatever the density, so render at CSS resolution (or below): on a 2x screen that is a quarter of the fill.
+    const dpr = state.scale;
     const w = Math.max(1, Math.round(innerWidth * dpr));
     const h = Math.max(1, Math.round(innerHeight * dpr));
     if (canvas.width === w && canvas.height === h && hdr) return;
@@ -341,8 +349,13 @@ async function boot() {
   reseed();
 
   // ---- frame loop ----
-  let acc = 0, prev = performance.now(), winT = prev, winF = 0, settled = 0;
+  // GPU frame time = submit to onSubmittedWorkDone with one frame in flight.
+  // rAF rate alone hides a queue of unfinished GPU work, which is what feels like lag.
+  let acc = 0, prev = performance.now(), winT = prev, gpuMs = 0, inflight = false;
   function frame(now) {
+    requestAnimationFrame(frame);
+    if (inflight) return; // never queue frames behind a busy GPU
+
     const dt = Math.min(0.1, (now - prev) / 1000);
     prev = now;
     acc += dt;
@@ -365,7 +378,7 @@ async function boot() {
 
     const enc = device.createCommandEncoder();
     if (steps) {
-      const pass = enc.beginComputePass();
+      const pass = enc.beginComputePass(timed ? { timestampWrites: { querySet: qs, beginningOfPassWriteIndex: 0 } } : {});
       pass.setPipeline(stepPipe);
       pass.setBindGroup(0, stepBG);
       const groups = Math.ceil(state.n / WG);
@@ -373,7 +386,10 @@ async function boot() {
       pass.end();
     }
 
-    const rp = enc.beginRenderPass({ colorAttachments: [{ view: hdr.createView(), loadOp: "load", storeOp: "store" }] });
+    const rp = enc.beginRenderPass({
+      colorAttachments: [{ view: hdr.createView(), loadOp: "load", storeOp: "store" }],
+      ...(timed && !steps ? { timestampWrites: { querySet: qs, beginningOfPassWriteIndex: 0 } } : {}),
+    });
     rp.setPipeline(fadePipe);
     rp.setBlendConstant([TRAIL, TRAIL, TRAIL, TRAIL]);
     rp.draw(3);
@@ -384,24 +400,45 @@ async function boot() {
 
     const tp = enc.beginRenderPass({
       colorAttachments: [{ view: ctx.getCurrentTexture().createView(), loadOp: "clear", storeOp: "store", clearValue: { r: 0, g: 0, b: 0, a: 1 } }],
+      ...(timed ? { timestampWrites: { querySet: qs, endOfPassWriteIndex: 1 } } : {}),
     });
     tp.setPipeline(tonePipe);
     tp.setBindGroup(0, toneBG);
     tp.draw(3);
     tp.end();
-    device.queue.submit([enc.finish()]);
-
-    // Adaptive load: grow the active count while the frame rate holds, back off when it drops.
-    winF++;
-    if (now - winT > 1000) {
-      const fps = (winF * 1000) / (now - winT);
-      winF = 0; winT = now;
-      let n = state.n;
-      if (fps > 57 && settled < 3) n = Math.min(cap, Math.round(n * 1.5));
-      else if (fps < 48) { n = Math.max(MIN_N, Math.round(n * 0.7)); settled++; }
-      if (n !== state.n) { state.n = n; exposure(); }
+    if (timed) {
+      enc.resolveQuerySet(qs, 0, 2, qResolve, 0);
+      enc.copyBufferToBuffer(qResolve, 0, qRead, 0, 16);
     }
-    requestAnimationFrame(frame);
+    device.queue.submit([enc.finish()]);
+    inflight = true;
+    const t0 = performance.now();
+    const sample = (ms) => {
+      inflight = false;
+      if (ms > 0 && ms < 1000) gpuMs = gpuMs ? gpuMs + (ms - gpuMs) * 0.15 : ms;
+    };
+    if (timed) {
+      qRead.mapAsync(GPUMapMode.READ).then(() => {
+        const t = new BigUint64Array(qRead.getMappedRange());
+        const ms = Number(t[1] - t[0]) / 1e6;
+        qRead.unmap();
+        sample(ms);
+      }, () => sample(0));
+    } else {
+      device.queue.onSubmittedWorkDone().then(() => sample(performance.now() - t0));
+    }
+
+    // Adaptive load: grow only with clear headroom, back off fast when over budget.
+    if (now - winT > 500) {
+      winT = now;
+      let n = state.n;
+      if (gpuMs > BUDGET) {
+        if (n > MIN_N) n = Math.max(MIN_N, Math.round(n * 0.6));
+        else if (state.scale > 0.5) { state.scale -= 0.25; resize(); }
+      } else if (gpuMs < BUDGET * 0.5 && n < cap) n = Math.min(cap, Math.round(n * 1.25));
+      if (n !== state.n) { state.n = n; exposure(); }
+      $("n").textContent = `${fmt(state.n)} · ${gpuMs.toFixed(1)}ms`;
+    }
   }
   requestAnimationFrame(frame);
 
