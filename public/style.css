@@ -137,6 +137,15 @@ canvas {
 .tut[data-step="tap"] .finger { animation: tap 0.9s ease-out infinite; }
 .tut[data-step="drag"] .finger { animation: drag 1.8s ease-in-out infinite; }
 .tut[data-step="zoom"] .finger { animation: zoom 1.4s ease-in-out infinite alternate; }
+.tut[data-step="move"] .finger { animation: move 1.8s ease-in-out infinite; }
+.tut[data-step="move"] .finger::before {
+  content: "";
+  position: absolute;
+  left: 30px; top: -18px;
+  width: 40px; height: 40px;
+  border: 1.5px solid var(--sodium);
+  border-radius: 50%;
+}
 .tut[data-step="again"] .finger,
 .tut[data-step="time"] .finger { display: none; }
 @keyframes hold {
@@ -150,6 +159,12 @@ canvas {
   15% { opacity: 1; }
   85% { opacity: 1; }
   100% { transform: translateX(56px); opacity: 0; }
+}
+@keyframes move {
+  0% { transform: translate(-40px, 40px); opacity: 0; }
+  15% { opacity: 1; }
+  85% { opacity: 1; }
+  100% { transform: translate(40px, -40px); opacity: 0; }
 }
 @keyframes zoom {
   from { transform: scale(0.6); }

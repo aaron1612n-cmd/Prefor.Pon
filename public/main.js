@@ -322,7 +322,7 @@ fn step(@builtin(global_invocation_id) id: vec3u) {
     let dens = f32(atomicLoad(&gas[cellOf(p)]));
     let rf = f32(u.count) * KIND_SHARE.z / (f32(u.n * u.n) * 0.06);
     let over = dens / max(rf, 1e-3);
-    if (over > 2.5 && rnd(&h) < (over - 2.5) * 0.002 * u.dt * 60.0) {
+    if (over > 1.5 && rnd(&h) < (over - 1.5) * 0.002 * u.dt * 60.0) {
       at = vec2f(1.0, u.time);
     }
   } else if (kind == 1u && u.time - at.y > LIFE) {
@@ -433,7 +433,7 @@ struct R {
   gain: f32, gasGain: f32, exposure: f32, time: f32,
   well: vec4f,  // lens: screen px xy, Einstein radius px, -
   vp: mat4x4f,  // view-projection
-  sky: vec4f,   // sky offset in px, -
+  sky: vec4f,   // sky offset in px, splat radius x focal length, glow map height
 };
 `;
 
@@ -464,6 +464,10 @@ fn blackbody(t: f32) -> vec3f {
 
 const OFF = vec4f(2.0, 2.0, 2.0, 1.0); // outside clip space: culled
 
+// Inverse-square law. Flux falls as 1/d^2 while a patch of sky shrinks by the same factor, so
+// surface brightness, the thing a camera records, is the same at every zoom: true to life.
+fn near(w: f32) -> f32 { return min(${HOME * HOME} / max(w * w, 1e-4), 400.0); }
+
 fn starLight(i: u32, at: vec2f) -> vec3f {
   let kind = u32(at.x);
   let h = pcg(i * 9781u + 17u);
@@ -472,7 +476,7 @@ fn starLight(i: u32, at: vec2f) -> vec3f {
   var lum: f32;
   if (kind == 0u) {
     // Old population: K and G dwarfs and red giants. Colour from a skewed temperature spread.
-    t = 3400.0 + 2800.0 * x * x;
+    t = 3900.0 + 2600.0 * x * x;
     lum = 0.6 + 1.4 * x * x * x;
   } else {
     // Young population: O/B stars dominate the light, then fade and redden as they age.
@@ -489,23 +493,36 @@ fn starLight(i: u32, at: vec2f) -> vec3f {
   var o: VO;
   if (u32(at.x) >= 2u) { o.p = OFF; return o; }
   o.p = r.vp * vec4f(pos[i].xyz, 1.0);
-  o.c = vec4f(starLight(i, at), 0.0);
+  o.c = vec4f(starLight(i, at) * near(o.p.w), 0.0);
   return o;
 }
 
-// Quarter resolution: the same starlight (rgb) plus gas column (a). Upsampled, this is the
+// Half resolution: the same starlight (rgb) plus gas column (a). Upsampled, this is the
 // smooth unresolved glow of a galaxy and the column density for dust and nebulae.
-@vertex fn glow(@builtin(vertex_index) i: u32) -> VO {
+// A particle stands for a cloud of stars with a real size, so it is splatted as a Gaussian
+// of fixed world radius: a dot from afar, a soft patch up close. The weight is normalised by
+// the footprint's area, so a galaxy's surface brightness is the same at every zoom.
+struct SO { @builtin(position) p: vec4f, @location(0) c: vec4f, @location(1) q: vec3f };
+@vertex fn glow(@builtin(vertex_index) v: u32, @builtin(instance_index) i: u32) -> SO {
   let at = attr[i];
   let kind = u32(at.x);
-  var o: VO;
+  var o: SO;
   if (kind >= 3u) { o.p = OFF; return o; }
-  o.p = r.vp * vec4f(pos[i].xyz, 1.0);
-  o.c = select(vec4f(starLight(i, at), 0.0), vec4f(0.0, 0.0, 0.0, r.gasGain), kind == 2u);
+  let corner = vec2f(f32((0x32u >> v) & 1u), f32((0x2cu >> v) & 1u)) * 2.0 - 1.0; // two triangles
+  var c = r.vp * vec4f(pos[i].xyz, 1.0);
+  if (c.w <= 0.0) { o.p = OFF; return o; }
+  let rad = max(1.5 * r.sky.z / c.w * r.sky.w * 0.5, 1.5); // quad radius in glow-map pixels
+  let ndc = rad * 2.0 / r.sky.w;
+  c = vec4f(c.xy + corner * vec2f(ndc * r.vp[0][0] / r.vp[1][1], ndc) * c.w, c.zw);
+  o.p = c;
+  o.c = select(vec4f(starLight(i, at), 0.0), vec4f(0.0, 0.0, 0.0, r.gasGain), kind == 2u) * near(c.w);
+  o.q = vec3f(corner, 1.0 / (0.6555 * rad * rad)); // 0.6555 R^2 = integral of the kernel below
   return o;
 }
 
 @fragment fn fs(i: VO) -> @location(0) vec4f { return i.c; }
+// A Gaussian cut to reach exactly zero at the quad's inscribed circle, so no square edges show.
+@fragment fn splat(i: SO) -> @location(0) vec4f { return i.c * (max(exp(-4.5 * dot(i.q.xy, i.q.xy)) - 0.011109, 0.0) * i.q.z); }
 `;
 
 const FULL_VS = /* wgsl */ `
@@ -556,7 +573,7 @@ fn sky(px: vec2f) -> vec3f {
   return col;
 }
 
-// Active nuclei: each central black hole shines by what it swallows (the gas column around it)
+// Nuclei: each central black hole shines faintly by what it swallows (the gas column around it)
 // and flares for ~100 Myr after a merger. Seen through a telescope as a point-spread function.
 fn nuclei(px: vec2f, size: vec2f) -> vec3f {
   var col = vec3f(0.0);
@@ -566,13 +583,14 @@ fn nuclei(px: vec2f, size: vec2f) -> vec3f {
     let c = r.vp * vec4f(pos[k].xyz, 1.0);
     if (c.w <= 0.0) { continue; }
     let uv = vec2f(c.x / c.w * 0.5 + 0.5, 0.5 - c.y / c.w * 0.5);
-    let gasHere = textureSampleLevel(glowMap, lin, uv, 0.0).a / 16.0;
-    let flare = select(0.0, exp(-(u.time - at.y) / 0.7) * 60.0, at.y > -1.0);
+    let gasHere = textureSampleLevel(glowMap, lin, uv, 0.0).a / 4.0;
+    let flare = select(0.0, exp(-(u.time - at.y) / 0.7) * 12.0, at.y > -1.0);
     // Black-hole mass tracks host mass, so a dwarf's nucleus is a faint fraction of a giant's.
-    let l = (0.4 * min(gasHere, 4.0) + flare) * min(u.gal[k * 4u + 1u].w * 2.5, 1.0);
+    // A nucleus is a point source: its flux falls with distance squared (c.w), unlike surface brightness.
+    let l = (0.06 * min(gasHere, 4.0) + flare) * min(u.gal[k * 4u + 1u].w * 2.5, 1.0) * min(${HOME * HOME} / (c.w * c.w), 4.0);
     if (l <= 0.0) { continue; }
-    let d = length(px - uv * size) / (1.5 + 0.004 * size.y);
-    col += vec3f(0.75, 0.85, 1.0) * l / ((1.0 + d * d) * (1.0 + d * d * 0.02));
+    let d = length(px - uv * size) / (1.0 + 0.0015 * size.y);
+    col += vec3f(0.85, 0.9, 1.0) * l * (exp(-d * d) + 0.03 / pow(1.0 + d * d * 0.25, 1.5));
   }
   return col;
 }
@@ -594,18 +612,18 @@ fn filmic(x: vec3f) -> vec3f { // ACES fit (Narkowicz)
     shadow = smoothstep(0.35, 0.55, sqrt(d2) / r.well.z);
   }
   let uv = px / size;
-  // Most of a galaxy's light is unresolved stars: mix each crisp point with the quarter-res
+  // Most of a galaxy's light is unresolved stars: mix each crisp point with the half-res
   // glow map (tent-filtered upsample), so sparse counts read as smooth light, not glitter.
   let q = 1.0 / vec2f(textureDimensions(glowMap));
   let gl = (textureSampleLevel(glowMap, lin, uv, 0.0) * 2.0
           + textureSampleLevel(glowMap, lin, uv + vec2f(q.x, 0.0), 0.0) + textureSampleLevel(glowMap, lin, uv - vec2f(q.x, 0.0), 0.0)
           + textureSampleLevel(glowMap, lin, uv + vec2f(0.0, q.y), 0.0) + textureSampleLevel(glowMap, lin, uv - vec2f(0.0, q.y), 0.0)) / 6.0;
   let sharp = textureSampleLevel(light, lin, uv, 0.0).rgb;
-  var c = sharp * 0.3 + gl.rgb * (0.7 / 16.0);
-  let gasD = gl.a / 16.0;
+  var c = sharp * 0.3 + gl.rgb * (0.7 / 4.0);
+  let gasD = gl.a / 4.0;
   // H-II regions: gas lit up by hot young stars. H-alpha red plus H-beta/[O III] blue reads pink.
   // Young light is what is bluer than the old population, so ionisation follows the blue excess.
-  let young = max(gl.b - gl.r * 0.75, 0.0) / 16.0;
+  let young = max(gl.b - gl.r * 0.75, 0.0) / 4.0;
   c += vec3f(1.0, 0.3, 0.5) * young * min(gasD, 3.0) * 0.6;
   // Dust: reddening extinction along the line of sight, stronger in blue (R_V ~ 3.1).
   // Seen edge-on, a thin gas disc has a huge column: that is the dark lane through the middle.
@@ -700,7 +718,12 @@ async function boot() {
     primitive: { topology: "point-list" },
   });
   const starPipe = points("stars", HDR);
-  const glowPipe = points("glow", "rgba16float");
+  const glowPipe = device.createRenderPipeline({
+    layout: drawPL,
+    vertex: { module: drawMod, entryPoint: "glow" },
+    fragment: { module: drawMod, entryPoint: "splat", targets: [{ format: "rgba16float", blend: blend("one", "one") }] },
+    primitive: { topology: "triangle-list" },
+  });
   const sampler = device.createSampler({ magFilter: "linear", minFilter: "linear" });
   const tonePipe = device.createRenderPipeline({
     layout: "auto",
@@ -725,11 +748,12 @@ async function boot() {
 
   const state = {
     n: Math.min(cap, FIXED_N || (coarse ? 1 << 15 : 1 << 16)), // start light, grow only while the GPU has headroom
-    scale: 1, // internal render resolution, dropped only if the minimum count still misses budget
+    scale: coarse ? Math.min(2, devicePixelRatio || 1) : 1, // internal render resolution, dropped only if the minimum count still misses budget
     time: 0,
     aspect: 1,
     // The encounter runs along x: a tall screen looks at it from the side, so it runs top to bottom.
-    cam: innerHeight > innerWidth ? { yaw: Math.PI / 2, pitch: 1.05, dist: HOME * 1.15 } : { yaw: 0, pitch: 1.05, dist: HOME },
+    cam: innerHeight > innerWidth ? { yaw: Math.PI / 2, pitch: 1.05, dist: HOME * 1.15, target: [0, 0, 0] } : { yaw: 0, pitch: 1.05, dist: HOME, target: [0, 0, 0] },
+    glide: null, // {from, to, t0}: double-tap recentring
     hole: null, // world position of the finger's black hole while held
     holeAt: 0,
     keys: new Set(),
@@ -884,14 +908,14 @@ async function boot() {
     device.queue.submit([enc.finish()]);
   }
 
-  // ---- camera: orbits the origin; z is the "up" of the sky ----
+  // ---- camera: orbits a movable target; z is the "up" of the sky ----
   const camera = {
     frame() {
-      const { yaw, pitch, dist } = state.cam;
-      const eye = [dist * Math.cos(pitch) * Math.sin(yaw), -dist * Math.cos(pitch) * Math.cos(yaw), dist * Math.sin(pitch)];
-      const f = v3.norm(v3.scale(eye, -1));
+      const { yaw, pitch, dist, target } = state.cam;
+      const off = [dist * Math.cos(pitch) * Math.sin(yaw), -dist * Math.cos(pitch) * Math.cos(yaw), dist * Math.sin(pitch)];
+      const f = v3.norm(v3.scale(off, -1));
       const s = v3.norm(v3.cross(f, [0, 0, 1]));
-      return { eye, f, s, up: v3.cross(s, f) };
+      return { eye: v3.add(target, off), f, s, up: v3.cross(s, f) };
     },
     viewProj() {
       const { eye, f, s, up } = this.frame();
@@ -902,12 +926,20 @@ async function boot() {
       for (let c = 0; c < 4; c++) for (let r = 0; r < 4; r++) for (let k = 0; k < 4; k++) M[c * 4 + r] += P[k * 4 + r] * V[c * 4 + k];
       return M;
     },
-    // Where a screen point meets the plane through the origin that faces the camera.
+    // Where a screen point meets the plane through the target that faces the camera.
     toWorld(ndc) {
       const { s, up } = this.frame();
       const half = state.cam.dist * Math.tan(FOV / 2);
-      return v3.add(v3.scale(s, ndc[0] * half * state.aspect), v3.scale(up, ndc[1] * half));
+      return v3.add(state.cam.target, v3.add(v3.scale(s, ndc[0] * half * state.aspect), v3.scale(up, ndc[1] * half)));
     },
+    // Slide the view by a screen distance in CSS px: the world under the finger follows it.
+    pan(dx, dy) {
+      const { s, up } = this.frame();
+      const k = (2 * state.cam.dist * Math.tan(FOV / 2)) / canvas.getBoundingClientRect().height;
+      state.cam.target = v3.add(state.cam.target, v3.add(v3.scale(s, -dx * k), v3.scale(up, dy * k)));
+      state.glide = null;
+    },
+    glideTo(p) { state.glide = { from: state.cam.target, to: p, t0: performance.now() }; },
     toScreen(p, M) {
       const x = M[0] * p[0] + M[4] * p[1] + M[8] * p[2] + M[12];
       const y = M[1] * p[0] + M[5] * p[1] + M[9] * p[2] + M[13];
@@ -921,18 +953,17 @@ async function boot() {
     zoom(f) { state.cam.dist = Math.max(0.5, Math.min(6, state.cam.dist * f)); },
   };
 
-  // Keep surface brightness constant regardless of particle count, screen size and zoom:
-  // a galaxy's surface brightness does not change with distance, so per-star gain scales with d^2.
+  // Keep surface brightness constant regardless of particle count and screen size; zoom is
+  // handled per particle by the inverse-square law in the shaders.
   function exposure() {
     const px = canvas.width * canvas.height || 1;
-    const d2 = (state.cam.dist / HOME) ** 2;
-    rData[0] = ((0.25 * px) / state.n) * d2;
-    rData[1] = ((0.6 * px) / state.n) * d2;
+    rData[0] = (0.25 * px) / state.n;
+    rData[1] = (0.6 * px) / state.n;
     rData[2] = 0.32;
   }
 
   function resize() {
-    // Points are 1px whatever the density, so render at CSS resolution (or below): on a 2x screen that is a quarter of the fill.
+    // Desktop renders at CSS resolution; phones at device resolution, since CSS pixels there are huge.
     const dpr = state.scale;
     const w = Math.max(1, Math.round(innerWidth * dpr));
     const h = Math.max(1, Math.round(innerHeight * dpr));
@@ -942,7 +973,7 @@ async function boot() {
     hdr?.destroy(); glowTex?.destroy();
     const tex = GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING;
     hdr = device.createTexture({ size: [w, h], format: HDR, usage: tex });
-    glowTex = device.createTexture({ size: [Math.ceil(w / 4), Math.ceil(h / 4)], format: "rgba16float", usage: tex });
+    glowTex = device.createTexture({ size: [Math.ceil(w / 2), Math.ceil(h / 2)], format: "rgba16float", usage: tex });
     toneBG = device.createBindGroup({
       layout: tonePipe.getBindGroupLayout(0),
       entries: [
@@ -958,14 +989,16 @@ async function boot() {
     state.shocks.push({ p, born: performance.now(), s: 14 });
   }
 
-  // ---- input: drag orbits, pinch / wheel zooms, hold still = black hole, quick tap = supernova ----
+  // ---- input: drag orbits; pinch / wheel zooms; two fingers, right-drag, Shift-drag or WASD slide;
+  // double-tap flies there; hold still = black hole; quick tap = supernova ----
   const toNdc = (x, y) => {
     const r = canvas.getBoundingClientRect();
     return [((x - r.left) / r.width) * 2 - 1, 1 - ((y - r.top) / r.height) * 2];
   };
   const HOLD_MS = 260;
   const touches = new Map();
-  let gesture = null; // {mode: "pending" | "orbit" | "hole" | "pinch", ...}
+  let gesture = null; // {mode: "pending" | "orbit" | "pan" | "hole" | "pinch", ...}
+  let lastTap = null;
 
   function startHole() {
     if (gesture?.mode !== "pending") return;
@@ -980,11 +1013,13 @@ async function boot() {
       clearTimeout(gesture?.timer);
       state.hole = null;
       const [a, b] = [...touches.values()];
-      gesture = { mode: "pinch", pinch0: Math.hypot(a[0] - b[0], a[1] - b[1]), dist0: state.cam.dist };
+      gesture = { mode: "pinch", pinch0: Math.hypot(a[0] - b[0], a[1] - b[1]), dist0: state.cam.dist, mid: [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2] };
       return;
     }
     gesture = { mode: "pending", t0: performance.now(), x0: e.clientX, y0: e.clientY, lastX: e.clientX, lastY: e.clientY };
-    gesture.timer = setTimeout(startHole, HOLD_MS);
+    // Right button or Shift slides the view instead of orbiting.
+    if (e.button === 2 || e.shiftKey) gesture.mode = "pan";
+    else gesture.timer = setTimeout(startHole, HOLD_MS);
   });
   canvas.addEventListener("pointermove", (e) => {
     if (!touches.has(e.pointerId) || !gesture) return;
@@ -992,9 +1027,16 @@ async function boot() {
     if (gesture.mode === "pinch") {
       const [a, b] = [...touches.values()];
       if (!b) return;
+      const d = Math.hypot(a[0] - b[0], a[1] - b[1]);
       state.cam.dist = gesture.dist0;
-      camera.zoom(gesture.pinch0 / Math.max(1, Math.hypot(a[0] - b[0], a[1] - b[1])));
-      tutorial.done("zoom");
+      camera.zoom(gesture.pinch0 / Math.max(1, d));
+      if (Math.abs(d - gesture.pinch0) > 30) tutorial.done("zoom");
+      // Two fingers moving together slide the view.
+      const mid = [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2];
+      camera.pan(mid[0] - gesture.mid[0], mid[1] - gesture.mid[1]);
+      if (Math.hypot(mid[0] - gesture.mid0x, mid[1] - gesture.mid0y) > 40) tutorial.done("move");
+      gesture.mid0x ??= gesture.mid[0]; gesture.mid0y ??= gesture.mid[1];
+      gesture.mid = mid;
       return;
     }
     const dx = e.clientX - gesture.lastX, dy = e.clientY - gesture.lastY;
@@ -1007,6 +1049,9 @@ async function boot() {
       const k = 3 / canvas.getBoundingClientRect().height;
       camera.orbit(dx * k, dy * k);
       tutorial.done("drag");
+    } else if (gesture.mode === "pan") {
+      camera.pan(dx, dy);
+      if (Math.hypot(e.clientX - gesture.x0, e.clientY - gesture.y0) > 40) tutorial.done("move");
     } else if (gesture.mode === "hole") {
       state.hole = camera.toWorld(toNdc(e.clientX, e.clientY));
     }
@@ -1017,7 +1062,20 @@ async function boot() {
     clearTimeout(gesture.timer);
     const g = gesture;
     if (touches.size === 0) gesture = null;
-    if (g.mode === "pending" && e.type === "pointerup") { shock(camera.toWorld(toNdc(e.clientX, e.clientY))); tutorial.done("tap"); }
+    if (g.mode === "pending" && e.type === "pointerup") {
+      const p = camera.toWorld(toNdc(e.clientX, e.clientY));
+      const now = performance.now();
+      // A second quick tap nearby flies the view there; a single tap is a supernova.
+      if (lastTap && now - lastTap.t < 350 && Math.hypot(e.clientX - lastTap.x, e.clientY - lastTap.y) < 30) {
+        camera.glideTo(p);
+        tutorial.done("move");
+        lastTap = null;
+      } else {
+        shock(p);
+        tutorial.done("tap");
+        lastTap = { t: now, x: e.clientX, y: e.clientY };
+      }
+    }
     if (g.mode === "hole") {
       if (performance.now() - state.holeAt > 500) tutorial.done("hold");
       state.hole = null;
@@ -1033,9 +1091,11 @@ async function boot() {
   }, { passive: false });
 
   const ARROWS = { ArrowLeft: [-1, 0], ArrowRight: [1, 0], ArrowUp: [0, 1], ArrowDown: [0, -1] };
+  const WASD = { a: [-1, 0], d: [1, 0], w: [0, 1], s: [0, -1] };
   addEventListener("keydown", (e) => {
     if (e.target.closest?.("button, input")) return;
     if (ARROWS[e.key]) { state.keys.add(e.key); e.preventDefault(); }
+    else if (WASD[e.key.toLowerCase()]) state.keys.add(e.key.toLowerCase());
     else if (e.key === " ") { shock([0, 0, 0]); tutorial.done("tap"); e.preventDefault(); }
     else if (e.key === "Enter" && !state.hole) { state.hole = [0, 0, 0]; state.holeAt = performance.now(); }
     else if (e.key === "+" || e.key === "=") { camera.zoom(0.85); tutorial.done("zoom"); }
@@ -1048,6 +1108,7 @@ async function boot() {
   });
   addEventListener("keyup", (e) => {
     state.keys.delete(e.key);
+    state.keys.delete(e.key.toLowerCase());
     if (e.key === "Enter" && state.hole) {
       if (performance.now() - state.holeAt > 500) tutorial.done("hold");
       state.hole = null;
@@ -1078,10 +1139,29 @@ async function boot() {
     if (steps === maxSteps) acc = 0; // drop backlog rather than spiral
 
     if (state.keys.size) {
-      let kx = 0, ky = 0;
-      for (const k of state.keys) if (ARROWS[k]) { kx += ARROWS[k][0]; ky += ARROWS[k][1]; }
+      let kx = 0, ky = 0, px = 0, py = 0;
+      for (const k of state.keys) {
+        if (ARROWS[k]) { kx += ARROWS[k][0]; ky += ARROWS[k][1]; }
+        if (WASD[k]) { px += WASD[k][0]; py += WASD[k][1]; }
+      }
       camera.orbit(kx * dt * 1.2, ky * dt * 1.2);
       if (kx || ky) tutorial.done("drag");
+      // Fly forward/back along the view (W/S) and sideways (A/D), at a speed that suits the zoom.
+      if (px || py) {
+        const { f, s } = camera.frame();
+        const v = state.cam.dist * 0.6 * dt;
+        state.cam.target = v3.add(state.cam.target, v3.add(v3.scale(s, px * v), v3.scale(f, py * v)));
+        state.glide = null;
+        tutorial.done("move");
+      }
+    }
+    if (state.glide) {
+      // Ease the view onto a double-tapped point: the one deliberate motion in the interface.
+      const g = state.glide;
+      const t = Math.min(1, (now - g.t0) / 700);
+      const e = t < 0.5 ? 4 * t * t * t : 1 - (-2 * t + 2) ** 3 / 2;
+      state.cam.target = v3.add(g.from, v3.scale(v3.add(g.to, v3.scale(g.from, -1)), e));
+      if (t === 1) state.glide = null;
     }
 
     state.time += steps * DT;
@@ -1099,7 +1179,9 @@ async function boot() {
     }
     rData.set(M, 8);
     // The background sky turns with the camera.
-    rData.set([state.cam.yaw * canvas.height * 0.6, -state.cam.pitch * canvas.height * 0.6, 0, 0], 24);
+    // Splat radius ~250 pc at the default count, shrinking with the particle spacing.
+    const splat = 0.012 * Math.cbrt((1 << 18) / state.n) / Math.tan(FOV / 2);
+    rData.set([state.cam.yaw * canvas.height * 0.6, -state.cam.pitch * canvas.height * 0.6, splat, Math.ceil(canvas.height / 2)], 24);
     device.queue.writeBuffer(rBuf, 0, rData);
 
     const enc = device.createCommandEncoder();
@@ -1127,7 +1209,7 @@ async function boot() {
     const gp = enc.beginRenderPass({ colorAttachments: [{ view: glowTex.createView(), loadOp: "clear", clearValue: clear, storeOp: "store" }] });
     gp.setPipeline(glowPipe);
     gp.setBindGroup(0, drawBG);
-    gp.draw(state.n);
+    gp.draw(6, state.n);
     gp.end();
 
     const tp = enc.beginRenderPass({
@@ -1169,14 +1251,14 @@ async function boot() {
       } else if (gpuMs > BUDGET) {
         if (n > MIN_N) n = Math.max(MIN_N, Math.round(n * 0.6));
         else if (state.scale > 0.5) { state.scale -= 0.25; resize(); }
-      } else if (gpuMs < BUDGET * 0.5 && n < cap) n = Math.min(cap, Math.round(n * 1.25));
+      } else if (gpuMs < BUDGET * 0.75 && n < cap) n = Math.min(cap, Math.round(n * 1.25));
       state.n = n;
       $("n").textContent = `${fmt(state.n)} · ${gpuMs.toFixed(1)}ms · ${age(state.time)}`;
     }
   }
   requestAnimationFrame(frame);
 
-  if (!store.get("pp.tut5")) tutorial.start();
+  if (!store.get("pp.tut6")) tutorial.start();
 }
 
 function age(t) {
@@ -1216,6 +1298,7 @@ const tutorial = (() => {
   const steps = [
     { id: "drag", word: "Drag" },
     { id: "zoom", word: coarse ? "Pinch" : "Scroll" },
+    { id: "move", word: coarse ? "Slide" : "WASD" },
     { id: "hold", word: "Hold" },
     { id: "tap", word: "Tap" },
     { id: "time", word: "Time" },
@@ -1235,7 +1318,7 @@ const tutorial = (() => {
     el.hidden = true; learn.hidden = false; i = -1;
     $("again").classList.remove("beckon");
     $("clock").classList.remove("beckon");
-    store.set("pp.tut5", "1");
+    store.set("pp.tut6", "1");
   }
   $("skip").onclick = end;
 

@@ -35,12 +35,19 @@ A 3D WebGPU galaxy simulation: colliding galaxies under self-gravity, running en
 - **One draw call.** Particles render as `point-list` with additive blending, so density reads as brightness. Trails come from fading the previous frame with a blend constant, with no ping-pong buffer, and a fullscreen tonemap pass maps the result to the screen.
 - **Constant brightness.** Per-particle gain scales with pixels / particle count, so 16K and 8M look equally exposed.
 
+## Rendering at any zoom
+
+Every particle's light follows the inverse-square law from its own distance to the camera, while its footprint grows as it gets closer, so a galaxy's surface brightness is the same zoomed in or out, as it is through a real telescope. The smooth light is drawn as soft round patches of a fixed size in space (about 250 pc), so close-ups read as unresolved starlight, not scattered dots. Nuclei are point sources, with flux that falls with distance.
+
 ## Controls
 
 | Input | Action |
 | --- | --- |
 | Drag / arrow keys | Orbit the camera |
 | Pinch / scroll / + − | Zoom |
+| Two-finger slide / right-drag / Shift-drag | Slide the view |
+| W A S D | Fly forward, back and sideways |
+| Double-tap | Fly to that spot |
 | Hold still (touch or mouse) / Enter | A black hole grows under your finger |
 | Tap / Space | Supernova: a shock front blows stars outward |
 | ↻ / R | A new random encounter of two or three galaxies |
