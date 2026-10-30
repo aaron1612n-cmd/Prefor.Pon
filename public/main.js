@@ -81,6 +81,13 @@ const CLUSTER = -100.0; // birth-time marker for globular-cluster stars: they ke
 fn seed(@builtin(global_invocation_id) id: vec3u) {
   let i = id.x;
   if (i >= u.count) { return; }
+  // The first ngal particles are the central supermassive black holes: always inside any prefix.
+  if (i < u.ngal) {
+    pos[i] = u.gal[i * 3u].xy;
+    vel[i] = u.gal[i * 3u].zw;
+    attr[i] = vec2f(4.0, -1000.0);
+    return;
+  }
   var h = pcg(i ^ u.seed);
   let k = galaxyOf(rnd(&h));
   let g0 = u.gal[k * 3u];
@@ -176,7 +183,12 @@ fn deposit(@builtin(global_invocation_id) id: vec3u) {
   if (id.x >= u.count) { return; }
   let c = cellOf(pos[id.x]);
   let kind = u32(attr[id.x].x);
-  atomicAdd(&mass[c], select(1u, DM_WEIGHT, kind == 3u));
+  var w = select(1u, DM_WEIGHT, kind == 3u);
+  // A central black hole weighs ~1% of its galaxy here: heavier than real (~0.1%), so the
+  // coarse grid can still sink it to the centre of a merger remnant.
+  if (kind == 4u) { w = u32(0.01 * u.gal[id.x * 3u + 1u].w * f32(u.count) * MEAN_W); }
+  if (kind == 5u) { w = 0u; }
+  atomicAdd(&mass[c], w);
   if (kind == 2u) { atomicAdd(&gas[c], 1u); }
 }
 
@@ -289,7 +301,7 @@ fn step(@builtin(global_invocation_id) id: vec3u) {
 @compute @workgroup_size(${WG})
 fn spin(@builtin(global_invocation_id) id: vec3u) {
   let i = id.x;
-  if (i >= u.count || u32(attr[i].x) == 3u || attr[i].y == CLUSTER) { return; }
+  if (i >= u.count || u32(attr[i].x) >= 3u || attr[i].y == CLUSTER) { return; }
   var h = pcg(i ^ u.seed);
   let k = galaxyOf(rnd(&h));
   if (u32(u.gal[k * 3u + 2u].x) == 2u) { return; } // ellipticals do not rotate
@@ -299,6 +311,26 @@ fn spin(@builtin(global_invocation_id) id: vec3u) {
   let inward = max(-dot(sampleField(pos[i]), d / r), 0.0);
   let vc = sqrt(inward * r);
   vel[i] += vec2f(-d.y, d.x) / r * vc * u.gal[k * 3u + 1u].z;
+}
+
+// Black-hole mergers: when two central holes fall within a grid cell of each other they
+// coalesce (momentum conserved) and the survivor flares as a quasar, stamped with the time.
+@compute @workgroup_size(1)
+fn holes() {
+  for (var a = 0u; a < u.ngal; a++) {
+    if (u32(attr[a].x) != 4u) { continue; }
+    for (var b = a + 1u; b < u.ngal; b++) {
+      if (u32(attr[b].x) != 4u) { continue; }
+      let d = pos[b] - pos[a];
+      if (dot(d, d) > u.grav.w * u.grav.w) { continue; }
+      let ma = u.gal[a * 3u + 1u].w;
+      let mb = u.gal[b * 3u + 1u].w;
+      vel[a] = (vel[a] * ma + vel[b] * mb) / (ma + mb);
+      pos[a] = (pos[a] * ma + pos[b] * mb) / (ma + mb);
+      attr[a] = vec2f(4.0, u.time);
+      attr[b] = vec2f(5.0, u.time);
+    }
+  }
 }
 `;
 
@@ -366,7 +398,7 @@ fn starLight(i: u32, at: vec2f) -> vec3f {
   let at = attr[i];
   let kind = u32(at.x);
   var o: VO;
-  if (kind == 3u) { o.p = OFF; return o; }
+  if (kind >= 3u) { o.p = OFF; return o; }
   let p = pos[i];
   o.p = vec4f(p.x / u.aspect, p.y, 0.0, 1.0);
   o.c = select(vec4f(starLight(i, at), 0.0), vec4f(0.0, 0.0, 0.0, r.gasGain), kind == 2u);
@@ -386,12 +418,34 @@ const FULL_VS = /* wgsl */ `
 
 // Compositing: dust extinction and H-II emission from the gas map, a sky of distant
 // galaxies, gravitational lensing around the black hole, then a filmic curve.
-const TONE_WGSL = FULL_VS + /* wgsl */ `
+const TONE_WGSL = FULL_VS + U_WGSL + /* wgsl */ `
 struct R { gain: f32, gasGain: f32, exposure: f32, time: f32, well: vec4f }; // well: px xy, Einstein radius px, -
 @group(0) @binding(0) var light: texture_2d<f32>;
 @group(0) @binding(1) var glowMap: texture_2d<f32>;
 @group(0) @binding(2) var lin: sampler;
 @group(0) @binding(3) var<uniform> r: R;
+@group(0) @binding(4) var<uniform> u: U;
+@group(0) @binding(5) var<storage, read> pos: array<vec2f>;
+@group(0) @binding(6) var<storage, read> attr: array<vec2f>;
+
+// Active nuclei: each central black hole shines by what it swallows (the gas column around it)
+// and flares for ~100 Myr after a merger. Seen through a telescope as a point spread function.
+fn nuclei(px: vec2f, size: vec2f) -> vec3f {
+  var col = vec3f(0.0);
+  for (var k = 0u; k < u.ngal; k++) {
+    let at = attr[k];
+    if (u32(at.x) != 4u) { continue; }
+    let p = pos[k];
+    let uv = vec2f((p.x / u.aspect + 1.0) * 0.5, (1.0 - p.y) * 0.5);
+    let gasHere = textureSampleLevel(glowMap, lin, uv, 0.0).a / 16.0;
+    let flare = select(0.0, exp(-(u.time - at.y) / 0.7) * 60.0, at.y > -1.0);
+    let l = 0.4 * min(gasHere, 4.0) + flare;
+    if (l <= 0.0) { continue; }
+    let d = length(px - uv * size) / (1.5 + 0.004 * size.y);
+    col += vec3f(0.75, 0.85, 1.0) * l / ((1.0 + d * d) * (1.0 + d * d * 0.02));
+  }
+  return col;
+}
 
 fn hash2(p: vec2f) -> vec2f {
   let q = vec2f(dot(p, vec2f(127.1, 311.7)), dot(p, vec2f(269.5, 183.3)));
@@ -455,6 +509,7 @@ fn filmic(x: vec3f) -> vec3f { // ACES fit (Narkowicz)
   // Dust: reddening extinction, stronger in blue (roughly R_V = 3.1).
   c *= exp(-gasD * vec3f(0.5, 0.7, 1.0) * 0.9);
   c += sky(px);
+  c += nuclei(px, size);
   c *= shadow;
   let mapped = filmic(c * r.exposure);
   return vec4f(pow(mapped, vec3f(1.0 / 2.2)), 1.0);
@@ -498,7 +553,7 @@ async function boot() {
   });
   const simPL = device.createPipelineLayout({ bindGroupLayouts: [simLayout] });
   const cp = (entryPoint) => device.createComputePipeline({ layout: simPL, compute: { module: simMod, entryPoint } });
-  const seedPipe = cp("seed"), clearPipe = cp("clear"), depositPipe = cp("deposit"), gravityPipe = cp("gravity"), stepPipe = cp("step"), spinPipe = cp("spin");
+  const seedPipe = cp("seed"), clearPipe = cp("clear"), depositPipe = cp("deposit"), gravityPipe = cp("gravity"), stepPipe = cp("step"), spinPipe = cp("spin"), holesPipe = cp("holes");
   const blend = (srcFactor, dstFactor) => ({ color: { srcFactor, dstFactor, operation: "add" }, alpha: { srcFactor, dstFactor, operation: "add" } });
   const drawLayout = device.createBindGroupLayout({
     entries: [
@@ -683,6 +738,7 @@ async function boot() {
       entries: [
         { binding: 0, resource: hdr.createView() }, { binding: 1, resource: glowTex.createView() },
         { binding: 2, resource: sampler }, { binding: 3, resource: { buffer: rBuf } },
+        { binding: 4, resource: { buffer: uBuf } }, { binding: 5, resource: { buffer: pos } }, { binding: 6, resource: { buffer: attr } },
       ],
     });
     exposure();
@@ -808,6 +864,7 @@ async function boot() {
         pass.setPipeline(depositPipe); pass.dispatchWorkgroups(groups);
         pass.setPipeline(gravityPipe); pass.dispatchWorkgroups(Math.ceil(cells / 64));
         pass.setPipeline(stepPipe); pass.dispatchWorkgroups(groups);
+        pass.setPipeline(holesPipe); pass.dispatchWorkgroups(1);
       }
       pass.end();
     }

@@ -10,6 +10,7 @@ A WebGPU galaxy simulation: colliding spiral galaxies under self-gravity, runnin
 - **Disc rotation from the measured field.** After seeding, one gravity solve runs and every disc particle gets the circular speed that the grid force actually gives at its position. A mismatched start makes cold gas ring in concentric waves.
 - **Spiral density waves seeded:** a two-armed logarithmic spiral with a pitch of about 15°, strongest in gas and young stars.
 - **Star formation and feedback.** Gas above about 6x the mean local gas density turns into young stars, faster the denser it is. After about 70 Myr, a third of the young stars go supernova and return to gas with a kick, and the rest join the old population. Mergers trigger starbursts and use up the gas.
+- **Central black holes.** Every galaxy has one, about 1% of its mass, which is heavier than real (about 0.1%) so the coarse grid can still sink it. When two holes come within a grid cell of each other they merge, conserving momentum, and the survivor flares as a quasar for about 100 Myr. Between mergers, each nucleus glows in proportion to the gas around it.
 - **Units:** 1 length unit is 25 kpc and 1 sim second is 150 Myr. The time control shows Myr per second, and the readout shows the elapsed time.
 
 ## Rendering
